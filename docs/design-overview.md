@@ -41,7 +41,7 @@
 
 ## 3. 技術方針
 
-- 言語: Go 1.27.2。
+- 言語: Go 1.27.3。
 - 標準ライブラリを優先する。HTTP は `net/http`、TLS は `crypto/tls`、JSON は `encoding/json/v2`、ログは `log/slog`、設定は環境変数（`os.Getenv`）。
 - 外部依存は次に限る。
   - `github.com/wmnsk/milenage`: Milenage 計算
