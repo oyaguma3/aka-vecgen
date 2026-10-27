@@ -33,11 +33,25 @@ Docker Engine と compose プラグインが必要です。
 cp .env.example .env
 ```
 
-`.env` の `VALKEY_PASSWORD` を変更してから起動します。
+`.env` の `VALKEY_PASSWORD` を変更します。
+
+加入者の鍵（Ki・OPc）とサーバー証明書の秘密鍵は、KEK（鍵を暗号化する鍵）で暗号化して Valkey に保存します。KEK は 32 バイトの乱数を 16 進で書いたファイルで、Valkey とは別に `secrets/kek` に置きます。コンテナは UID 65532 で動くので、この UID で読めるようにします。
+
+```bash
+mkdir -p secrets && chmod 700 secrets
+openssl rand -hex 32 > secrets/kek
+sudo chown 65532 secrets/kek && sudo chmod 600 secrets/kek
+```
+
+（イメージを作った後なら `docker compose run --rm --no-deps -T aka-vecgen gen-kek > secrets/kek` でも作れます。イメージがまだないと、ビルドの経過が同じ出力に混じるので、先に `docker compose build` をします。作った後は同じく `chown` と `chmod` をします。）**KEK を失うと、全加入者の鍵を登録し直すことになります。** 作ったら、Valkey のバックアップとは別の場所（オフライン）にも写しを置いてください。
+
+起動します。
 
 ```bash
 docker compose up -d --build
 ```
+
+初めての起動で、KEK の識別子（SHA-256 の先頭 8 バイトの 16 進）を Valkey に書きます。以降の起動では、KEK のファイルがその識別子と合わなければ起動しません。
 
 初回起動時に、認証ベクターAPI 用の自己署名サーバー証明書を自動生成します。クライアントが `localhost` 以外の名前や IP アドレスで接続する場合は、初回起動の前に `.env` の `VECGEN_AV_TLS_HOSTS` に指定してください。
 
@@ -124,6 +138,8 @@ curl --cacert admin.pem --cert bff.pem https://localhost:9443/admin/v2/status
 | コマンド | 内容 |
 |---|---|
 | `serve` | サーバーを起動する（既定） |
+| `gen-kek` | KEK を作る。`-out` を省くと標準出力に書く。ファイルは権限 600 で作り、上書きしない |
+| `rotate-kek -old <ファイル> -new <ファイル>` | 加入者の鍵とサーバー証明書の秘密鍵を新しい KEK で暗号化し直す（下の「KEK の入れ替え」） |
 | `subscriber add` / `show` / `del` | 加入者を登録・表示・削除する |
 | `client add` / `list` / `del` | AVクライアントを登録・一覧・削除する |
 | `client gen-cert` | クライアント用の自己署名証明書と秘密鍵を生成する |
@@ -134,6 +150,24 @@ curl --cacert admin.pem --cert bff.pem https://localhost:9443/admin/v2/status
 
 各コマンドのオプションは `-h` で確認できます。`subscriber add` の `-sqn-type` には SQN 増加タイプ（`inc1` / `inc32` / `inc33`）を指定します。
 
+### KEK の入れ替え
+
+`serve` を止めてから行います（動いていると `rotate-kek` は断ります）。加入者 500 件ずつ暗号化し直し、行ごとに KEK の識別子を持つので、途中で止まっても同じファイルでやり直せば続きから終わります。入れ替えの途中は、`serve` もほかのコマンドも起動しません。
+
+```bash
+openssl rand -hex 32 > secrets/kek-new
+sudo chown 65532 secrets/kek-new && sudo chmod 600 secrets/kek-new
+docker compose stop aka-vecgen
+docker compose run --rm --no-deps -v ./secrets/kek-new:/run/secrets/kek-new:ro aka-vecgen rotate-kek -old /run/secrets/kek -new /run/secrets/kek-new
+```
+
+終わったら `secrets/kek` を新しいファイルに置き換え（古い KEK は、入れ替える前に取った Valkey のバックアップのために保管しておく）、コンテナを作り直して起動します。KEK のファイルは 1 つのファイルとしてコンテナに渡しているので、`mv` で置き換えると、作り直さない限り古いファイルを見たままになります。
+
+```bash
+mv secrets/kek secrets/kek-old && mv secrets/kek-new secrets/kek
+docker compose up -d --force-recreate aka-vecgen
+```
+
 ## 設定
 
 `.env` で指定します。
@@ -141,6 +175,7 @@ curl --cacert admin.pem --cert bff.pem https://localhost:9443/admin/v2/status
 | 変数 | 既定値 | 内容 |
 |---|---|---|
 | `VALKEY_PASSWORD` | （必須） | Valkey のパスワード |
+| `VECGEN_KEK_FILE` | `/run/secrets/kek` | KEK のファイル（compose では `secrets/kek` を Docker の secrets で渡す） |
 | `VECGEN_AV_TLS_PUBLISH` | `0.0.0.0:8443` | mTLS リスナーを公開するホスト側のアドレスとポート |
 | `VECGEN_AV_TLS_HOSTS` | `localhost,127.0.0.1,aka-vecgen` | AV 用の自己署名サーバー証明書の SAN。生成済みの証明書には反映されない |
 | `VECGEN_ADMIN_CLIENTS` | （空） | 管理クライアント。`識別名=フィンガープリント` のカンマ区切り。空なら管理API を起動しない |

@@ -533,6 +533,13 @@ func (h *Handler) getSubscriberKeys(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ki, opc, err := h.Store.SubscriberKeys(r.Context(), sub.IMSI)
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
 	h.audit(r, "subscriber.keys.read", sub.IMSI, nil)
-	writeJSON(w, http.StatusOK, subscriberKeysJSON{Ki: hex.EncodeToString(sub.Ki), OPc: hex.EncodeToString(sub.OPc)})
+	writeJSON(w, http.StatusOK, subscriberKeysJSON{Ki: hex.EncodeToString(ki), OPc: hex.EncodeToString(opc)})
+	clear(ki)
+	clear(opc)
 }

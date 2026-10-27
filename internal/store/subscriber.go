@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"slices"
 	"strconv"
@@ -28,6 +27,7 @@ func (s State) Valid() bool {
 }
 
 // Subscriber は加入者データ。
+// Ki と OPc は登録のときに渡すだけで、読み出しでは入れない（復号するのは払い出しと SubscriberKeys だけ。設計概要 §8）。
 type Subscriber struct {
 	IMSI             string
 	Ki               []byte
@@ -43,13 +43,13 @@ type Subscriber struct {
 }
 
 // KEYS: sub:{imsi}, sub:{imsi}:clients, subs
-// ARGV: imsi, 現在日時, ki, opc, sqn, amf, sqn_type, state, 許可クライアントID...
+// ARGV: imsi, 現在日時, cred（暗号化した Ki ‖ OPc）, cred_kek（KEK の識別子）, sqn, amf, sqn_type, state, 許可クライアントID...
 var createSubscriberScript = valkey.NewLuaScript(`
 if redis.call('EXISTS', KEYS[1]) == 1 then
   return 0
 end
 redis.call('HSET', KEYS[1],
-  'ki', ARGV[3], 'opc', ARGV[4], 'sqn', ARGV[5], 'amf', ARGV[6],
+  'cred', ARGV[3], 'cred_kek', ARGV[4], 'sqn', ARGV[5], 'amf', ARGV[6],
   'sqn_type', ARGV[7], 'state', ARGV[8], 'state_changed_at', ARGV[2],
   'created_at', ARGV[2], 'updated_at', ARGV[2])
 redis.call('DEL', KEYS[2])
@@ -86,12 +86,19 @@ func (s *Store) CreateSubscriber(ctx context.Context, sub Subscriber) error {
 	if sub.State != StateActive && sub.State != StateInactive {
 		return fmt.Errorf("state must be active or inactive at registration: %q", string(sub.State))
 	}
+	if len(sub.Ki) != 16 || len(sub.OPc) != 16 {
+		return fmt.Errorf("ki and opc must be 16 bytes")
+	}
 	if err := s.checkClientsExist(ctx, sub.AllowedClientIDs); err != nil {
 		return err
 	}
+	cred, err := s.sealCred(sub.IMSI, sub.Ki, sub.OPc)
+	if err != nil {
+		return fmt.Errorf("create subscriber: %w", err)
+	}
 	args := []string{
 		sub.IMSI, now(),
-		hex.EncodeToString(sub.Ki), hex.EncodeToString(sub.OPc),
+		string(cred), s.kek.ID(),
 		strconv.FormatUint(sub.SQN&aka.SQNMask, 10),
 		fmt.Sprintf("%04x", sub.AMF),
 		string(sub.SQNType), string(sub.State),
@@ -130,7 +137,7 @@ func (s *Store) checkClientsExist(ctx context.Context, ids []int64) error {
 	return nil
 }
 
-// GetSubscriber は加入者を返す。Ki と OPc を含む。
+// GetSubscriber は加入者を返す。Ki と OPc は含めない（SubscriberKeys で読む）。
 func (s *Store) GetSubscriber(ctx context.Context, imsi string) (Subscriber, error) {
 	subs, err := s.getSubscribers(ctx, []string{imsi})
 	if err != nil {
@@ -185,7 +192,7 @@ func subscriberFromFields(imsi string, f map[string]string, clientIDs []string) 
 		UpdatedAt:      parseTime(f["updated_at"]),
 	}
 	var err error
-	if sub.Ki, sub.OPc, sub.AMF, err = decodeCredentials(f["ki"], f["opc"], f["amf"]); err != nil {
+	if sub.AMF, err = parseAMF(f["amf"]); err != nil {
 		return Subscriber{}, fmt.Errorf("subscriber %s: %w", imsi, err)
 	}
 	if sub.SQN, err = strconv.ParseUint(f["sqn"], 10, 64); err != nil {
@@ -286,18 +293,12 @@ func (s *Store) setState(ctx context.Context, imsi string, to State, reinstate b
 	return "", false, fmt.Errorf("set state: unexpected reply %q", out[0])
 }
 
-func decodeCredentials(ki, opc, amf string) (k, o []byte, a uint16, err error) {
-	if k, err = hex.DecodeString(ki); err != nil || len(k) != 16 {
-		return nil, nil, 0, fmt.Errorf("bad ki")
-	}
-	if o, err = hex.DecodeString(opc); err != nil || len(o) != 16 {
-		return nil, nil, 0, fmt.Errorf("bad opc")
-	}
+func parseAMF(amf string) (uint16, error) {
 	v, err := strconv.ParseUint(amf, 16, 16)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("bad amf")
+		return 0, fmt.Errorf("bad amf")
 	}
-	return k, o, uint16(v), nil
+	return uint16(v), nil
 }
 
 // SubscriberPatch は加入者の変更内容。nil の項目は変更しない。

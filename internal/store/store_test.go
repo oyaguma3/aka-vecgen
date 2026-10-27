@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"errors"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/oyaguma3/aka-vecgen/internal/aka"
 	"github.com/oyaguma3/aka-vecgen/internal/certs"
+	"github.com/oyaguma3/aka-vecgen/internal/kek"
 )
 
 // 結合テストは実際の Valkey に接続する。接続先を環境変数で指定したときだけ実行する。
@@ -34,7 +36,30 @@ func openTestStore(t *testing.T) *Store {
 	if err := s.c.Do(t.Context(), s.c.B().Flushdb().Build()).Error(); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.SetupKEK(t.Context(), testKEK(t, 1)); err != nil {
+		t.Fatal(err)
+	}
 	return s
+}
+
+// keysOf は加入者の鍵を復号して返す。
+func keysOf(t *testing.T, s *Store, imsi string) (ki, opc []byte) {
+	t.Helper()
+	ki, opc, err := s.SubscriberKeys(t.Context(), imsi)
+	if err != nil {
+		t.Fatalf("SubscriberKeys(%s): %v", imsi, err)
+	}
+	return ki, opc
+}
+
+// testKEK は試験用の KEK（32 バイトを b で埋めたもの）を作る。
+func testKEK(t *testing.T, b byte) *kek.KEK {
+	t.Helper()
+	k, err := kek.New(bytes.Repeat([]byte{b}, kek.Size))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
 }
 
 func testSubscriber(imsi string, typ aka.SQNType) Subscriber {
@@ -101,7 +126,8 @@ func TestSubscriberLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got.Ki) != string(sub.Ki) || string(got.OPc) != string(sub.OPc) || got.SQN != 0x20 ||
+	// 読み出しには鍵を入れない。鍵は SubscriberKeys で復号して読む
+	if ki, opc := keysOf(t, s, sub.IMSI); got.Ki != nil || got.OPc != nil || string(ki) != string(sub.Ki) || string(opc) != string(sub.OPc) || got.SQN != 0x20 ||
 		got.AMF != 0x8000 || got.SQNType != aka.SQNInc32 || got.State != StateActive || got.StateChangedAt.IsZero() {
 		t.Errorf("GetSubscriber = %+v", got)
 	}
@@ -536,7 +562,7 @@ func TestUpdateSubscriber(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.SQN != 0x1000 || got.AMF != 0x8000 || got.SQNType != aka.SQNInc32 ||
-		string(got.Ki) != string(sub.Ki) || !slices.Equal(got.AllowedClientIDs, []int64{c1.ID}) {
+		!slices.Equal(got.AllowedClientIDs, []int64{c1.ID}) {
 		t.Errorf("after partial update: %+v", got)
 	}
 
@@ -549,7 +575,7 @@ func TestUpdateSubscriber(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ = s.GetSubscriber(ctx, sub.IMSI)
-	if string(got.Ki) != string(sub.Ki) || got.AMF != 0x9001 ||
+	if ki, _ := keysOf(t, s, sub.IMSI); string(ki) != string(sub.Ki) || got.AMF != 0x9001 ||
 		got.SQNType != aka.SQNInc33 || !slices.Equal(got.AllowedClientIDs, []int64{c2.ID}) || got.SQN != 0x1000 {
 		t.Errorf("after full update: %+v", got)
 	}

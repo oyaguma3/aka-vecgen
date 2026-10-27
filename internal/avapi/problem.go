@@ -30,6 +30,10 @@ const (
 	ReasonClientUnknown    = "client_unknown"
 )
 
+// ReasonCredInvalid は、加入者の暗号化した鍵が読めないこと（平文の行、別の KEK、壊れている）。
+// 一般的な拒否ではなく 500 にし、理由をログにだけ残す（確認事項 D1）。
+const ReasonCredInvalid = "subscriber_cred_invalid"
+
 // problemDetails は TS 29.571 の ProblemDetails のうち、このサーバーが返す項目。
 type problemDetails struct {
 	Title  string `json:"title"`

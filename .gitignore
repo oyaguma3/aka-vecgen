@@ -1,5 +1,7 @@
 .env
 *.pem
+# KEK（鍵を暗号化する鍵）
+/secrets/
 /aka-vecgen
 
 # 検証用の環境の情報などを含むので公開しない

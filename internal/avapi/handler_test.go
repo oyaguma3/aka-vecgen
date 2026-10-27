@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json/v2"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -386,5 +387,24 @@ func TestCacheControl(t *testing.T) {
 		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
 			t.Errorf("body %s: Cache-Control = %q, want no-store", body, got)
 		}
+	}
+}
+
+func TestGenerateCredInvalid(t *testing.T) {
+	// 加入者の暗号化した鍵が読めない（平文の行・別の KEK）ときは 500 にし、理由をログにだけ残す（確認事項 D1）。
+	var logs bytes.Buffer
+	f := &fakeAllocator{err: fmt.Errorf("allocate: subscriber x: %w: encrypted with another KEK", store.ErrCredInvalid)}
+	h := &Handler{
+		Allocator: f,
+		Log:       slog.New(slog.NewJSONHandler(&logs, nil)),
+		ClientID:  func(*http.Request) int64 { return 7 },
+	}
+	rec := post(t, h.Routes(), basePath+"eap-aka/generate-av", `{"hssAuthType":"EAP_AKA","numOfRequestedVectors":1}`)
+	checkProblem(t, rec, http.StatusInternalServerError, causeSystemFailure)
+	if strings.Contains(rec.Body.String(), "KEK") {
+		t.Errorf("internal error detail leaked: %s", rec.Body)
+	}
+	if !strings.Contains(logs.String(), `"reason":"subscriber_cred_invalid"`) || !strings.Contains(logs.String(), `"level":"ERROR"`) {
+		t.Errorf("log = %s", logs.String())
 	}
 }

@@ -21,6 +21,8 @@ type statusJSON struct {
 	SubscriberCount             int64     `json:"subscriberCount"`
 	ClientCount                 int64     `json:"clientCount"`
 	AVServerCertificateNotAfter time.Time `json:"avServerCertificateNotAfter"`
+	// KEKID は使っている KEK の識別子（SHA-256 の先頭 8 バイトの 16 進。設計概要 §8.1）。
+	KEKID string `json:"kekId"`
 }
 
 func (h *Handler) getStatus(w http.ResponseWriter, r *http.Request) {
@@ -51,6 +53,7 @@ func (h *Handler) getStatus(w http.ResponseWriter, r *http.Request) {
 		SubscriberCount:             subs,
 		ClientCount:                 clients,
 		AVServerCertificateNotAfter: cert.NotAfter.UTC(),
+		KEKID:                       h.Store.KEKID(),
 	})
 }
 

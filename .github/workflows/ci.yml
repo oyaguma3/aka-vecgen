@@ -83,6 +83,9 @@ jobs:
         run: |
           cp .env.example .env
           sed -i "s|^VALKEY_PASSWORD=.*|VALKEY_PASSWORD=ci-$(openssl rand -hex 12)|" .env
+          mkdir -p secrets && chmod 700 secrets
+          openssl rand -hex 32 > secrets/kek
+          sudo chown 65532 secrets/kek && sudo chmod 600 secrets/kek
           # aka-vecgen と Valkey が healthy になるまで待つ（compose の healthcheck の確認を兼ねる）。
           docker compose up -d --build --wait --wait-timeout 120
       - name: クライアントと加入者の登録
@@ -158,6 +161,11 @@ jobs:
           git -C aka-mvpset log -1 --format='aka-mvpset: %h %s'
           go build -o "$RUNNER_TEMP/aka-vecgen" ./cmd/aka-vecgen
           go -C aka-mvpset/conformance/av-api build -o "$RUNNER_TEMP/av-conformance" ./cmd/av-conformance
+      - name: KEK の作成
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/aka-vecgen" gen-kek -out kek
+          echo "VECGEN_KEK_FILE=$RUNNER_TEMP/kek" >> "$GITHUB_ENV"
       - name: 試験用のクライアントと加入者の投入
         working-directory: ${{ runner.temp }}
         run: sh "$GITHUB_WORKSPACE/aka-mvpset/conformance/av-api/fixtures/aka-vecgen.sh" out ./av-conformance ./aka-vecgen

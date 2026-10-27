@@ -17,6 +17,8 @@ type Config struct {
 	ValkeyAddr string
 	// ValkeyPassword は Valkey のパスワード。
 	ValkeyPassword string
+	// KEKFile は加入者の鍵とサーバー証明書の秘密鍵を暗号化する KEK のファイル（設計概要 §8.1）。
+	KEKFile string
 
 	// AVTLSAddr は認証ベクターAPI の mTLS リスナーの待ち受けアドレス。
 	AVTLSAddr string
@@ -44,6 +46,7 @@ func Load() (Config, error) {
 	c := Config{
 		ValkeyAddr:     cmp.Or(os.Getenv("VECGEN_VALKEY_ADDR"), "valkey:6379"),
 		ValkeyPassword: os.Getenv("VECGEN_VALKEY_PASSWORD"),
+		KEKFile:        cmp.Or(os.Getenv("VECGEN_KEK_FILE"), "/run/secrets/kek"),
 		AVTLSAddr:      cmp.Or(os.Getenv("VECGEN_AV_TLS_ADDR"), ":8443"),
 		AVTLSHosts:     splitList(cmp.Or(os.Getenv("VECGEN_AV_TLS_HOSTS"), "localhost,127.0.0.1")),
 		AdminAddr:      cmp.Or(os.Getenv("VECGEN_ADMIN_ADDR"), ":9443"),

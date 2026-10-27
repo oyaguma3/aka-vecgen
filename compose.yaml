@@ -18,9 +18,14 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    # KEK（加入者の鍵とサーバー証明書の秘密鍵を暗号化する鍵。設計概要 §8）。Valkey とは別のファイルで渡す。
+    # コンテナは UID 65532 で動くので、この UID で読めるようにする（README の「起動」）。
+    secrets:
+      - kek
     environment:
       VECGEN_VALKEY_ADDR: valkey:6379
       VECGEN_VALKEY_PASSWORD: ${VALKEY_PASSWORD:?.env に VALKEY_PASSWORD を設定してください}
+      VECGEN_KEK_FILE: /run/secrets/kek
       VECGEN_AV_TLS_ADDR: ":8443"
       VECGEN_AV_TLS_HOSTS: ${VECGEN_AV_TLS_HOSTS:-localhost,127.0.0.1,aka-vecgen}
       VECGEN_ADMIN_ADDR: ":9443"
@@ -53,6 +58,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+secrets:
+  kek:
+    file: ./secrets/kek
 
 networks:
   # 同一ホスト上の別の compose プロジェクト（AKA-RADIUS サーバーや BFF など）が接続するためのネットワーク。

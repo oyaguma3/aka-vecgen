@@ -23,6 +23,10 @@
 | `seq:client` | String | クライアントID の発番カウンター |
 | `cfg:av_tls` | Hash | AV 用サーバー証明書と秘密鍵 |
 | `cfg:admin_tls` | Hash | 管理API 用サーバー証明書と秘密鍵 |
+| `cfg:kek` | String | KEK の識別子（初めての起動で書く） |
+| `cfg:kek_check` | String | 決まった値を KEK で暗号化したもの（起動のときに復号して KEK を確かめる） |
+| `cfg:kek_rotation` | String | `rotate-kek` の途中だけある（古い識別子:新しい識別子）。ある間は serve とコマンドが起動しない |
+| `cfg:serve:alive` | String | serve が動いている印（TTL 30 秒、10 秒ごとに書き直す）。ある間は `rotate-kek` が断る |
 | `audit` | Stream | 監査ログ |
 
 ## 3. 加入者
@@ -33,8 +37,8 @@
 
 | フィールド | 形式 | 内容 |
 |---|---|---|
-| `ki` | 16進 32 桁 | Ki |
-| `opc` | 16進 32 桁 | OPc |
+| `cred` | バイト列 | Ki ‖ OPc（32 バイト）を KEK で暗号化したもの（AES-256-GCM。nonce 12 バイト ‖ 暗号文。AAD は `aka-vecgen/sub/<IMSI>`） |
+| `cred_kek` | 16進 16 桁 | `cred` を暗号化した KEK の識別子（`rotate-kek` のやり直しに使う） |
 | `sqn` | 10進整数（0 〜 2^48−1） | 最後に払い出した SQN。API では 16進 12 桁で表す |
 | `amf` | 16進 4 桁 | AMF |
 | `sqn_type` | `inc1` / `inc32` / `inc33` | SQN 増加タイプ |
@@ -61,7 +65,7 @@
 
 - 登録: `sub:{imsi}` が既にあれば失敗。なければ Hash、Set、索引を作る。状態は `active` か `inactive`（`terminated` では登録できない）。
 - 削除: `state` が `active` なら断る（`ACTIVE`）。それ以外は Hash、Set、索引を消す。
-- 変更: `state` が `terminated` なら断る。鍵（`ki`・`opc`）は登録の後に変えない。
+- 変更: `state` が `terminated` なら断る。鍵（`cred`）は登録の後に変えない。
 - 状態の変更: 移り方の規則を 1 つの Lua で確かめる。`terminated` からは、戻し（`reinstate`。`inactive` にする）だけが許される。同じ状態への変更は書き込まない。
 
 ## 4. SQN の払い出し
@@ -108,7 +112,7 @@
 5. `state` が `terminated` なら `TERMINATED`、`active` でなければ `INACTIVE` を返す。
 6. `ARGV[3]` があれば、S をその値に置き換える。
 7. `sqn_type` と n から払い出し後の値を計算して `sqn` に書き込む。n が 0 で再同期でもなければ書き込まない。
-8. `OK` とともに、S（加算前の値）、`ki`、`opc`、`amf`、`sqn_type`、Network Name を返す。
+8. `OK` とともに、S（加算前の値）、`cred`、`cred_kek`、`amf`、`sqn_type`、Network Name を返す。鍵は Go の側で要求ごとに復号する（KEK の識別子が違う、復号できない行は 500）。
 
 拒否した場合（1〜5）は SQN を進めない。2〜5 の拒否は、認証ベクターAPI ではどれも同じ一般的な拒否（403）になり、理由はログにだけ残る。
 
@@ -178,7 +182,8 @@ AV 用と管理API 用で、同じ形式の Hash を別々のキーに持つ。
 | フィールド | 形式 | 内容 |
 |---|---|---|
 | `cert_pem` | PEM | サーバー証明書（中間証明書を含めてよい） |
-| `key_pem` | PEM | 秘密鍵 |
+| `key_enc` | バイト列 | 秘密鍵（PEM）を KEK で暗号化したもの（AAD は `aka-vecgen/cert/<av|admin>`） |
+| `key_kek` | 16進 16 桁 | `key_enc` を暗号化した KEK の識別子 |
 | `source` | `self-signed` / `uploaded` | 自動生成か持ち込みか |
 | `updated_at` | 日時 | 更新日時 |
 

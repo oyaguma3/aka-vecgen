@@ -20,6 +20,7 @@ import (
 	"github.com/oyaguma3/aka-vecgen/internal/adminapi"
 	"github.com/oyaguma3/aka-vecgen/internal/certs"
 	"github.com/oyaguma3/aka-vecgen/internal/config"
+	"github.com/oyaguma3/aka-vecgen/internal/kek"
 	"github.com/oyaguma3/aka-vecgen/internal/logbuf"
 	"github.com/oyaguma3/aka-vecgen/internal/server"
 	"github.com/oyaguma3/aka-vecgen/internal/store"
@@ -63,6 +64,13 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
+	testKEK, err := kek.New(bytes.Repeat([]byte{7}, kek.Size))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetupKEK(t.Context(), testKEK); err != nil {
+		t.Fatal(err)
+	}
 
 	logs := logbuf.New(100)
 	log := slog.New(logs.Handler(slog.NewTextHandler(io.Discard, nil)))

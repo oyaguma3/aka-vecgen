@@ -52,7 +52,7 @@ end
 if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 0 then
   return {'FORBIDDEN'}
 end
-local f = redis.call('HMGET', sub, 'sqn', 'ki', 'opc', 'amf', 'sqn_type', 'state')
+local f = redis.call('HMGET', sub, 'sqn', 'cred', 'cred_kek', 'amf', 'sqn_type', 'state')
 if f[6] == 'terminated' then
   return {'TERMINATED'}
 end
@@ -82,7 +82,7 @@ if n > 0 or ARGV[3] ~= '' then
   redis.call('HSET', sub, 'sqn', string.format('%.0f', (base + adv) % 281474976710656))
 end
 
-return {'OK', string.format('%.0f', base), f[2], f[3], f[4], f[5], network_name}
+return {'OK', string.format('%.0f', base), f[2] or '', f[3] or '', f[4], f[5], network_name}
 `)
 
 // AllocateRequest は SQN の払い出し要求。
@@ -145,7 +145,11 @@ func (s *Store) Allocate(ctx context.Context, req AllocateRequest) (Allocation, 
 	if a.Base, err = strconv.ParseUint(out[1], 10, 64); err != nil {
 		return Allocation{}, fmt.Errorf("allocate: subscriber %s: bad sqn: %w", req.IMSI, err)
 	}
-	if a.Credentials.Ki, a.Credentials.OPc, a.Credentials.AMF, err = decodeCredentials(out[2], out[3], out[4]); err != nil {
+	// 鍵は要求ごとに復号する（設計概要 §8.1）。平文の行・別の KEK の行は ErrCredInvalid（確認事項 D1）
+	if a.Credentials.Ki, a.Credentials.OPc, err = s.openCred(req.IMSI, out[2], out[3]); err != nil {
+		return Allocation{}, fmt.Errorf("allocate: subscriber %s: %w", req.IMSI, err)
+	}
+	if a.Credentials.AMF, err = parseAMF(out[4]); err != nil {
 		return Allocation{}, fmt.Errorf("allocate: subscriber %s: %w", req.IMSI, err)
 	}
 	return a, nil

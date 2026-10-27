@@ -128,6 +128,9 @@ func (h *Handler) generateAV(w http.ResponseWriter, r *http.Request) {
 	if p != nil {
 		switch {
 		case p.status >= http.StatusInternalServerError:
+			if p.reason != "" {
+				log = log.With("reason", p.reason)
+			}
 			log.Error("av request failed", "cause", p.cause, "detail", p.detail)
 			// 内部エラーの詳細はクライアントに返さない。
 			p.detail = ""
@@ -282,6 +285,10 @@ func allocateProblem(err error) *problem {
 		return rejected(ReasonInactive)
 	case errors.Is(err, store.ErrTerminated):
 		return rejected(ReasonTerminated)
+	case errors.Is(err, store.ErrCredInvalid):
+		p := internalError(err)
+		p.reason = ReasonCredInvalid
+		return p
 	}
 	return internalError(err)
 }

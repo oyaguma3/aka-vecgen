@@ -1040,6 +1040,7 @@ components:
         - subscriberCount
         - clientCount
         - avServerCertificateNotAfter
+        - kekId
       properties:
         version:
           type: string
@@ -1058,6 +1059,10 @@ components:
           type: string
           format: date-time
           description: AV用サーバー証明書の有効期限。
+        kekId:
+          type: string
+          pattern: '^[0-9a-f]{16}$'
+          description: 加入者の鍵とサーバー証明書の秘密鍵を暗号化している KEK の識別子（SHA-256 の先頭 8 バイトの 16 進）。
 
     LogEntry:
       type: object

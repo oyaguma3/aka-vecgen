@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/valkey-io/valkey-go"
+
+	"github.com/oyaguma3/aka-vecgen/internal/kek"
 )
 
 var (
@@ -49,9 +51,11 @@ func subClientsKey(imsi string) string { return "sub:" + imsi + ":clients" }
 func clientKey(id int64) string        { return "client:" + strconv.FormatInt(id, 10) }
 func clientFPKey(fp string) string     { return "clientfp:" + fp }
 
-// Store は Valkey への接続を持つ。
+// Store は Valkey への接続と、鍵を暗号化する KEK を持つ。
 type Store struct {
 	c valkey.Client
+	// kek は加入者の鍵とサーバー証明書の秘密鍵を暗号化する鍵。SetupKEK で設定する。
+	kek *kek.KEK
 }
 
 // Options は Valkey への接続設定。

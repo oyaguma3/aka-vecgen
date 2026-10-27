@@ -25,6 +25,8 @@ const maxBodyBytes = 256 << 10
 type Store interface {
 	CreateSubscriber(ctx context.Context, sub store.Subscriber) error
 	GetSubscriber(ctx context.Context, imsi string) (store.Subscriber, error)
+	SubscriberKeys(ctx context.Context, imsi string) (ki, opc []byte, err error)
+	KEKID() string
 	UpdateSubscriber(ctx context.Context, imsi string, p store.SubscriberPatch) error
 	DeleteSubscriber(ctx context.Context, imsi string) error
 	SetState(ctx context.Context, imsi string, to store.State) (from store.State, unchanged bool, err error)
