@@ -44,29 +44,29 @@ type Config struct {
 // Load は環境変数から設定を読み込む。
 func Load() (Config, error) {
 	c := Config{
-		ValkeyAddr:     cmp.Or(os.Getenv("AKA_VALKEY_ADDR"), "valkey:6379"),
-		ValkeyPassword: os.Getenv("AKA_VALKEY_PASSWORD"),
-		AVTLSAddr:      cmp.Or(os.Getenv("AKA_AV_TLS_ADDR"), ":8443"),
-		AVPlainAddr:    os.Getenv("AKA_AV_PLAIN_ADDR"),
-		AVTLSHosts:     splitList(cmp.Or(os.Getenv("AKA_AV_TLS_HOSTS"), "localhost,127.0.0.1")),
-		AdminAddr:      cmp.Or(os.Getenv("AKA_ADMIN_ADDR"), ":9443"),
-		AdminTLSHosts:  splitList(cmp.Or(os.Getenv("AKA_ADMIN_TLS_HOSTS"), "localhost,127.0.0.1")),
+		ValkeyAddr:     cmp.Or(os.Getenv("VECGEN_VALKEY_ADDR"), "valkey:6379"),
+		ValkeyPassword: os.Getenv("VECGEN_VALKEY_PASSWORD"),
+		AVTLSAddr:      cmp.Or(os.Getenv("VECGEN_AV_TLS_ADDR"), ":8443"),
+		AVPlainAddr:    os.Getenv("VECGEN_AV_PLAIN_ADDR"),
+		AVTLSHosts:     splitList(cmp.Or(os.Getenv("VECGEN_AV_TLS_HOSTS"), "localhost,127.0.0.1")),
+		AdminAddr:      cmp.Or(os.Getenv("VECGEN_ADMIN_ADDR"), ":9443"),
+		AdminTLSHosts:  splitList(cmp.Or(os.Getenv("VECGEN_ADMIN_TLS_HOSTS"), "localhost,127.0.0.1")),
 	}
-	if v := os.Getenv("AKA_LOG_LEVEL"); v != "" {
+	if v := os.Getenv("VECGEN_LOG_LEVEL"); v != "" {
 		if err := c.LogLevel.UnmarshalText([]byte(v)); err != nil {
-			return Config{}, fmt.Errorf("AKA_LOG_LEVEL: %w", err)
+			return Config{}, fmt.Errorf("VECGEN_LOG_LEVEL: %w", err)
 		}
 	}
 	var err error
-	if c.AdminClients, err = ParseAdminClients(os.Getenv("AKA_ADMIN_CLIENTS")); err != nil {
-		return Config{}, fmt.Errorf("AKA_ADMIN_CLIENTS: %w", err)
+	if c.AdminClients, err = ParseAdminClients(os.Getenv("VECGEN_ADMIN_CLIENTS")); err != nil {
+		return Config{}, fmt.Errorf("VECGEN_ADMIN_CLIENTS: %w", err)
 	}
-	logBuffer, err := positiveInt("AKA_LOG_BUFFER", 1000)
+	logBuffer, err := positiveInt("VECGEN_LOG_BUFFER", 1000)
 	if err != nil {
 		return Config{}, err
 	}
 	c.LogBuffer = int(logBuffer)
-	if c.AuditMaxLen, err = positiveInt("AKA_AUDIT_MAX", 10000); err != nil {
+	if c.AuditMaxLen, err = positiveInt("VECGEN_AUDIT_MAX", 10000); err != nil {
 		return Config{}, err
 	}
 	return c, nil

@@ -1,4 +1,4 @@
-module github.com/oyaguma3/aka-only-server
+module github.com/oyaguma3/aka-vecgen
 
 go 1.27.3
 

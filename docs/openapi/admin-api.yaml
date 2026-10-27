@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: aka-only-server 管理API
+  title: aka-vecgen 管理API
   version: 0.2.0
   description: |
     加入者、AVクライアント、AV用サーバー証明書、ログを操作する API。
@@ -904,7 +904,7 @@ components:
       properties:
         version:
           type: string
-          description: aka-only-server のバージョン。
+          description: aka-vecgen のバージョン。
         bootId:
           type: string
           description: 起動ごとに変わる識別子。`/logs` の `bootId` と同じ値。

@@ -30,7 +30,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      AKA_TEST_VALKEY_ADDR: localhost:6379
+      VECGEN_TEST_VALKEY_ADDR: localhost:6379
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -65,7 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: イメージのビルド
-        run: docker build --build-arg VERSION="${GITHUB_SHA::7}" -t aka-only-server:ci .
+        run: docker build --build-arg VERSION="${GITHUB_SHA::7}" -t aka-vecgen:ci .
       - name: compose の設定
         run: |
           cp .env.example .env
@@ -83,14 +83,14 @@ jobs:
         run: |
           cp .env.example .env
           sed -i "s|^VALKEY_PASSWORD=.*|VALKEY_PASSWORD=ci-$(openssl rand -hex 12)|" .env
-          # aka-only-server と Valkey が healthy になるまで待つ（compose の healthcheck の確認を兼ねる）。
+          # aka-vecgen と Valkey が healthy になるまで待つ（compose の healthcheck の確認を兼ねる）。
           docker compose up -d --build --wait --wait-timeout 120
       - name: クライアントと加入者の登録
         run: |
-          docker compose exec -T aka-only-server /aka-only-server client gen-cert -name radius > radius.pem
-          docker compose exec -T aka-only-server /aka-only-server client add -name radius -cert - < radius.pem
-          docker compose exec -T aka-only-server /aka-only-server subscriber add -imsi 440100123456789 -ki 465b5ce8b199b49faa5f0a2ee238a6bc -opc cd63cb71954a9f4e48a5994e37a02baf -clients 1
-          docker compose exec -T aka-only-server /aka-only-server av-cert > server.pem
+          docker compose exec -T aka-vecgen /aka-vecgen client gen-cert -name radius > radius.pem
+          docker compose exec -T aka-vecgen /aka-vecgen client add -name radius -cert - < radius.pem
+          docker compose exec -T aka-vecgen /aka-vecgen subscriber add -imsi 440100123456789 -ki 465b5ce8b199b49faa5f0a2ee238a6bc -opc cd63cb71954a9f4e48a5994e37a02baf -clients 1
+          docker compose exec -T aka-vecgen /aka-vecgen av-cert > server.pem
       - name: 認証ベクターの取得（eap-aka / umts-aka / eap-aka-prime）
         run: |
           get() {

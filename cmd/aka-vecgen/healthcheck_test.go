@@ -5,7 +5,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/oyaguma3/aka-only-server/internal/config"
+	"github.com/oyaguma3/aka-vecgen/internal/config"
 )
 
 func TestListenerAddrs(t *testing.T) {

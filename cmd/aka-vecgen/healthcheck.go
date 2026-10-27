@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/oyaguma3/aka-only-server/internal/config"
+	"github.com/oyaguma3/aka-vecgen/internal/config"
 )
 
 // healthcheckTimeout は、healthcheck でリスナー 1 つに接続するときの上限。

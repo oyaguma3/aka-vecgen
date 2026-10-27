@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: aka-only-server 認証ベクターAPI
+  title: aka-vecgen 認証ベクターAPI
   version: 0.2.0-draft
   description: |
     Milenage による AKA 認証ベクターを払い出す API。

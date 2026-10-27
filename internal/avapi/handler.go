@@ -13,9 +13,9 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/oyaguma3/aka-only-server/internal/aka"
-	"github.com/oyaguma3/aka-only-server/internal/store"
-	"github.com/oyaguma3/aka-only-server/internal/traceid"
+	"github.com/oyaguma3/aka-vecgen/internal/aka"
+	"github.com/oyaguma3/aka-vecgen/internal/store"
+	"github.com/oyaguma3/aka-vecgen/internal/traceid"
 )
 
 // DefaultNetworkName は、クライアントに Network Name が設定されていない場合に

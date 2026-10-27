@@ -1,4 +1,4 @@
-// aka-only-server は Milenage による AKA 認証ベクターを払い出す API サーバー。
+// aka-vecgen は Milenage による AKA 認証ベクターを払い出す API サーバー。
 package main
 
 import (
@@ -11,17 +11,17 @@ import (
 	"time"
 	"uuid"
 
-	"github.com/oyaguma3/aka-only-server/internal/adminapi"
-	"github.com/oyaguma3/aka-only-server/internal/config"
-	"github.com/oyaguma3/aka-only-server/internal/logbuf"
-	"github.com/oyaguma3/aka-only-server/internal/server"
-	"github.com/oyaguma3/aka-only-server/internal/store"
+	"github.com/oyaguma3/aka-vecgen/internal/adminapi"
+	"github.com/oyaguma3/aka-vecgen/internal/config"
+	"github.com/oyaguma3/aka-vecgen/internal/logbuf"
+	"github.com/oyaguma3/aka-vecgen/internal/server"
+	"github.com/oyaguma3/aka-vecgen/internal/store"
 )
 
 // version はビルド時に -ldflags "-X main.version=..." で埋め込む。
 var version = "dev"
 
-const usage = `usage: aka-only-server <command>
+const usage = `usage: aka-vecgen <command>
 
 commands:
   serve                     サーバーを起動する（コマンド省略時の既定）

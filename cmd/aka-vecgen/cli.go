@@ -13,16 +13,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/oyaguma3/aka-only-server/internal/aka"
-	"github.com/oyaguma3/aka-only-server/internal/certs"
-	"github.com/oyaguma3/aka-only-server/internal/store"
+	"github.com/oyaguma3/aka-vecgen/internal/aka"
+	"github.com/oyaguma3/aka-vecgen/internal/certs"
+	"github.com/oyaguma3/aka-vecgen/internal/store"
 )
 
 var imsiPattern = regexp.MustCompile(`^[0-9]{5,15}$`)
 
 func subscriberCommand(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: aka-only-server subscriber add|show|del [options]")
+		return errors.New("usage: aka-vecgen subscriber add|show|del [options]")
 	}
 	fs := flag.NewFlagSet("subscriber "+args[0], flag.ExitOnError)
 	imsi := fs.String("imsi", "", "IMSI（5〜15 桁の数字）")
@@ -125,7 +125,7 @@ func subscriberCommand(ctx context.Context, args []string) error {
 
 func clientCommand(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: aka-only-server client add|list|del|gen-cert [options]")
+		return errors.New("usage: aka-vecgen client add|list|del|gen-cert [options]")
 	}
 	fs := flag.NewFlagSet("client "+args[0], flag.ExitOnError)
 
@@ -253,14 +253,14 @@ func adminCertCommand(ctx context.Context, args []string) error {
 	if args[0] != "reset" {
 		return fmt.Errorf("unknown admin-cert command %q", args[0])
 	}
-	// 現在の AKA_ADMIN_TLS_HOSTS で自己署名証明書を作り直す。反映にはサーバーの再起動が必要。
+	// 現在の VECGEN_ADMIN_TLS_HOSTS で自己署名証明書を作り直す。反映にはサーバーの再起動が必要。
 	cfg, st, err := openStore(ctx)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 	certPEM, keyPEM, err := certs.SelfSigned(certs.SelfSignedOptions{
-		CommonName: "aka-only-server",
+		CommonName: "aka-vecgen",
 		Hosts:      cfg.AdminTLSHosts,
 		ValidFor:   10 * 365 * 24 * time.Hour,
 	})

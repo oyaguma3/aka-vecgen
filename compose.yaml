@@ -1,9 +1,9 @@
 services:
-  aka-only-server:
+  aka-vecgen:
     build:
       context: .
       args:
-        VERSION: ${AKA_VERSION:-dev}
+        VERSION: ${VECGEN_VERSION:-dev}
     restart: unless-stopped
     # 停止の合図からリスナーを閉じ終えるまで最大 10 秒かかる（server.go の shutdownTimeout）。
     # Docker の既定の猶予（10 秒）では強制終了と重なるので、長くする。
@@ -13,28 +13,28 @@ services:
         condition: service_healthy
     # リスナーに接続できるかを確かめる（distroless のため curl はない。mTLS なので TCP の接続まで）。
     healthcheck:
-      test: ["CMD", "/aka-only-server", "healthcheck"]
+      test: ["CMD", "/aka-vecgen", "healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 15s
     environment:
-      AKA_VALKEY_ADDR: valkey:6379
-      AKA_VALKEY_PASSWORD: ${VALKEY_PASSWORD:?.env に VALKEY_PASSWORD を設定してください}
-      AKA_AV_TLS_ADDR: ":8443"
-      AKA_AV_PLAIN_ADDR: ${AKA_AV_PLAIN_ADDR:-}
-      AKA_AV_TLS_HOSTS: ${AKA_AV_TLS_HOSTS:-localhost,127.0.0.1,aka-only-server}
-      AKA_ADMIN_ADDR: ":9443"
-      AKA_ADMIN_CLIENTS: ${AKA_ADMIN_CLIENTS:-}
-      AKA_ADMIN_TLS_HOSTS: ${AKA_ADMIN_TLS_HOSTS:-localhost,127.0.0.1,aka-only-server}
-      AKA_LOG_LEVEL: ${AKA_LOG_LEVEL:-info}
-      AKA_LOG_BUFFER: ${AKA_LOG_BUFFER:-1000}
-      AKA_AUDIT_MAX: ${AKA_AUDIT_MAX:-10000}
+      VECGEN_VALKEY_ADDR: valkey:6379
+      VECGEN_VALKEY_PASSWORD: ${VALKEY_PASSWORD:?.env に VALKEY_PASSWORD を設定してください}
+      VECGEN_AV_TLS_ADDR: ":8443"
+      VECGEN_AV_PLAIN_ADDR: ${VECGEN_AV_PLAIN_ADDR:-}
+      VECGEN_AV_TLS_HOSTS: ${VECGEN_AV_TLS_HOSTS:-localhost,127.0.0.1,aka-vecgen}
+      VECGEN_ADMIN_ADDR: ":9443"
+      VECGEN_ADMIN_CLIENTS: ${VECGEN_ADMIN_CLIENTS:-}
+      VECGEN_ADMIN_TLS_HOSTS: ${VECGEN_ADMIN_TLS_HOSTS:-localhost,127.0.0.1,aka-vecgen}
+      VECGEN_LOG_LEVEL: ${VECGEN_LOG_LEVEL:-info}
+      VECGEN_LOG_BUFFER: ${VECGEN_LOG_BUFFER:-1000}
+      VECGEN_AUDIT_MAX: ${VECGEN_AUDIT_MAX:-10000}
     ports:
       # Docker が公開したポートは ufw の規則を通らない。公開範囲はここのバインド先で制御する。
-      - "${AKA_AV_TLS_PUBLISH:-0.0.0.0:8443}:8443"
-      - "${AKA_AV_PLAIN_PUBLISH:-127.0.0.1:8080}:8080"
-      - "${AKA_ADMIN_PUBLISH:-127.0.0.1:9443}:9443"
+      - "${VECGEN_AV_TLS_PUBLISH:-0.0.0.0:8443}:8443"
+      - "${VECGEN_AV_PLAIN_PUBLISH:-127.0.0.1:8080}:8080"
+      - "${VECGEN_ADMIN_PUBLISH:-127.0.0.1:9443}:9443"
     networks:
       - default
       - av
@@ -58,9 +58,9 @@ services:
 
 networks:
   # 同一ホスト上の別の compose プロジェクト（AKA-RADIUS サーバーや BFF など）が接続するためのネットワーク。
-  # 相手側では external として参照し、ホスト名 aka-only-server で接続する。Valkey はこのネットワークに出さない。
+  # 相手側では external として参照し、ホスト名 aka-vecgen で接続する。Valkey はこのネットワークに出さない。
   av:
-    name: ${AKA_SHARED_NETWORK:-aka-av}
+    name: ${VECGEN_SHARED_NETWORK:-aka-av}
 
 volumes:
   valkey-data:

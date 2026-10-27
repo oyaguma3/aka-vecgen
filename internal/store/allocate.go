@@ -7,7 +7,7 @@ import (
 
 	"github.com/valkey-io/valkey-go"
 
-	"github.com/oyaguma3/aka-only-server/internal/aka"
+	"github.com/oyaguma3/aka-vecgen/internal/aka"
 )
 
 // Allocation は SQN の払い出し結果。

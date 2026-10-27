@@ -10,7 +10,7 @@ import (
 
 	"github.com/valkey-io/valkey-go"
 
-	"github.com/oyaguma3/aka-only-server/internal/aka"
+	"github.com/oyaguma3/aka-vecgen/internal/aka"
 )
 
 // Subscriber は加入者データ。

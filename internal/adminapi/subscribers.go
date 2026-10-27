@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/oyaguma3/aka-only-server/internal/aka"
-	"github.com/oyaguma3/aka-only-server/internal/store"
+	"github.com/oyaguma3/aka-vecgen/internal/aka"
+	"github.com/oyaguma3/aka-vecgen/internal/store"
 )
 
 var (

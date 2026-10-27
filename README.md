@@ -1,9 +1,11 @@
-# aka-only-server
+# aka-vecgen
 
-[![CI](https://github.com/oyaguma3/aka-only-server/actions/workflows/ci.yml/badge.svg)](https://github.com/oyaguma3/aka-only-server/actions/workflows/ci.yml)
-[![govulncheck](https://github.com/oyaguma3/aka-only-server/actions/workflows/govulncheck.yml/badge.svg)](https://github.com/oyaguma3/aka-only-server/actions/workflows/govulncheck.yml)
+[![CI](https://github.com/oyaguma3/aka-vecgen/actions/workflows/ci.yml/badge.svg)](https://github.com/oyaguma3/aka-vecgen/actions/workflows/ci.yml)
+[![govulncheck](https://github.com/oyaguma3/aka-vecgen/actions/workflows/govulncheck.yml/badge.svg)](https://github.com/oyaguma3/aka-vecgen/actions/workflows/govulncheck.yml)
 
-> このリポジトリは、4 つのソフトウェア（[本PoC](https://github.com/oyaguma3/eapaka-radius-server-poc)、[aka-only-server](https://github.com/oyaguma3/aka-only-server)、[eapaka-node-provisioner](https://github.com/oyaguma3/eapaka-node-provisioner)、[eapaka-ossbss-sample](https://github.com/oyaguma3/eapaka-ossbss-sample)）を組み合わせを確かめて提供する **PoC セット**（[eapaka-pocset](https://github.com/oyaguma3/eapaka-pocset)）の一部です。組み合わせ（各リポジトリのコミット）、変更の記録（CHANGELOG）、1 台への導入の案内、4 つを通した試験は eapaka-pocset にあります。
+> このリポジトリは、VPS に分けて置いて顧客を収容する **MVP セット**（[aka-mvpset](https://github.com/oyaguma3/aka-mvpset)）の、認証ベクターを作るノードです。PoC セット（[eapaka-pocset](https://github.com/oyaguma3/eapaka-pocset) の `pocset-v1.0.1`）の [aka-only-server](https://github.com/oyaguma3/aka-only-server) の履歴を引き継いで作りました（もとのコミット `c2a093d`）。
+>
+> いまは名前を変えただけで、作りは aka-only-server と同じです（コマンドは `aka-vecgen`、環境変数の接頭辞は `VECGEN_`）。MVP のための改修（状態、鍵の暗号化、認証ベクターAPI の契約への合わせ込み、管理API 2.0.0 など）は、[設計概要](docs/design-overview.md)のとおりに MVP セットの段階 2 で行います。今の作りの説明は [PoC の設計概要](docs/poc/design-overview.md)にあります。
 
 指定した IMSI に対して、Milenage による AKA 認証ベクターを払い出す API サーバーです。EAP-AKA / EAP-AKA' の RADIUS サーバーなどから使うことを想定しています。
 
@@ -37,7 +39,7 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-初回起動時に、認証ベクターAPI 用の自己署名サーバー証明書を自動生成します。クライアントが `localhost` 以外の名前や IP アドレスで接続する場合は、初回起動の前に `.env` の `AKA_AV_TLS_HOSTS` に指定してください。
+初回起動時に、認証ベクターAPI 用の自己署名サーバー証明書を自動生成します。クライアントが `localhost` 以外の名前や IP アドレスで接続する場合は、初回起動の前に `.env` の `VECGEN_AV_TLS_HOSTS` に指定してください。
 
 ## クライアントと加入者の登録
 
@@ -46,25 +48,25 @@ docker compose up -d --build
 クライアント証明書と秘密鍵を生成します（手元の `openssl` で作った自己署名証明書でも構いません）。
 
 ```bash
-docker compose exec -T aka-only-server /aka-only-server client gen-cert -name radius > radius.pem
+docker compose exec -T aka-vecgen /aka-vecgen client gen-cert -name radius > radius.pem
 ```
 
 証明書を登録します。発番されたクライアントID が表示されます。
 
 ```bash
-docker compose exec -T aka-only-server /aka-only-server client add -name radius -cert - < radius.pem
+docker compose exec -T aka-vecgen /aka-vecgen client add -name radius -cert - < radius.pem
 ```
 
 加入者を登録し、払い出しを許可するクライアントID を指定します。
 
 ```bash
-docker compose exec -T aka-only-server /aka-only-server subscriber add -imsi 440100123456789 -ki 465b5ce8b199b49faa5f0a2ee238a6bc -opc cd63cb71954a9f4e48a5994e37a02baf -clients 1
+docker compose exec -T aka-vecgen /aka-vecgen subscriber add -imsi 440100123456789 -ki 465b5ce8b199b49faa5f0a2ee238a6bc -opc cd63cb71954a9f4e48a5994e37a02baf -clients 1
 ```
 
 クライアント側でサーバーを検証するために、サーバー証明書を取り出します。
 
 ```bash
-docker compose exec -T aka-only-server /aka-only-server av-cert > server.pem
+docker compose exec -T aka-vecgen /aka-vecgen av-cert > server.pem
 ```
 
 ## 認証ベクターの取得
@@ -92,14 +94,14 @@ curl --cacert server.pem --cert radius.pem -X POST https://localhost:8443/nudm-u
 管理クライアント（BFF など）の証明書を用意し、フィンガープリントを調べます。
 
 ```bash
-docker compose run --rm --no-deps -T aka-only-server client gen-cert -name bff > bff.pem
+docker compose run --rm --no-deps -T aka-vecgen client gen-cert -name bff > bff.pem
 ```
 
 ```bash
-docker compose run --rm --no-deps -T aka-only-server fingerprint < bff.pem
+docker compose run --rm --no-deps -T aka-vecgen fingerprint < bff.pem
 ```
 
-`.env` の `AKA_ADMIN_CLIENTS` に `識別名=フィンガープリント` の形で設定し、起動し直します。
+`.env` の `VECGEN_ADMIN_CLIENTS` に `識別名=フィンガープリント` の形で設定し、起動し直します。
 
 ```bash
 docker compose up -d
@@ -108,7 +110,7 @@ docker compose up -d
 管理API 用のサーバー証明書を取り出して、接続を確認します。
 
 ```bash
-docker compose exec -T aka-only-server /aka-only-server admin-cert > admin.pem
+docker compose exec -T aka-vecgen /aka-vecgen admin-cert > admin.pem
 ```
 
 ```bash
@@ -139,22 +141,22 @@ curl --cacert admin.pem --cert bff.pem https://localhost:9443/admin/v1/status
 | 変数 | 既定値 | 内容 |
 |---|---|---|
 | `VALKEY_PASSWORD` | （必須） | Valkey のパスワード |
-| `AKA_AV_TLS_PUBLISH` | `0.0.0.0:8443` | mTLS リスナーを公開するホスト側のアドレスとポート |
-| `AKA_AV_TLS_HOSTS` | `localhost,127.0.0.1,aka-only-server` | AV 用の自己署名サーバー証明書の SAN。生成済みの証明書には反映されない |
-| `AKA_AV_PLAIN_ADDR` | （空） | 平文HTTP リスナー。空なら無効、有効にする場合は `:8080` |
-| `AKA_AV_PLAIN_PUBLISH` | `127.0.0.1:8080` | 平文HTTP リスナーを公開するホスト側のアドレスとポート |
-| `AKA_ADMIN_CLIENTS` | （空） | 管理クライアント。`識別名=フィンガープリント` のカンマ区切り。空なら管理API を起動しない |
-| `AKA_ADMIN_PUBLISH` | `127.0.0.1:9443` | 管理API を公開するホスト側のアドレスとポート |
-| `AKA_ADMIN_TLS_HOSTS` | `localhost,127.0.0.1,aka-only-server` | 管理API 用の自己署名サーバー証明書の SAN。生成済みの証明書には反映されない |
-| `AKA_SHARED_NETWORK` | `aka-av` | 同一ホスト上の別の compose プロジェクトと共有する Docker ネットワークの名前 |
-| `AKA_LOG_LEVEL` | `info` | ログレベル |
-| `AKA_LOG_BUFFER` | `1000` | 管理API で返すためにメモリに保持するログの件数 |
-| `AKA_AUDIT_MAX` | `10000` | 監査ログの保持件数の上限 |
-| `AKA_VERSION` | `dev` | 起動ログと管理API の `/status` に出すバージョン（ビルドのときに埋め込む） |
+| `VECGEN_AV_TLS_PUBLISH` | `0.0.0.0:8443` | mTLS リスナーを公開するホスト側のアドレスとポート |
+| `VECGEN_AV_TLS_HOSTS` | `localhost,127.0.0.1,aka-vecgen` | AV 用の自己署名サーバー証明書の SAN。生成済みの証明書には反映されない |
+| `VECGEN_AV_PLAIN_ADDR` | （空） | 平文HTTP リスナー。空なら無効、有効にする場合は `:8080` |
+| `VECGEN_AV_PLAIN_PUBLISH` | `127.0.0.1:8080` | 平文HTTP リスナーを公開するホスト側のアドレスとポート |
+| `VECGEN_ADMIN_CLIENTS` | （空） | 管理クライアント。`識別名=フィンガープリント` のカンマ区切り。空なら管理API を起動しない |
+| `VECGEN_ADMIN_PUBLISH` | `127.0.0.1:9443` | 管理API を公開するホスト側のアドレスとポート |
+| `VECGEN_ADMIN_TLS_HOSTS` | `localhost,127.0.0.1,aka-vecgen` | 管理API 用の自己署名サーバー証明書の SAN。生成済みの証明書には反映されない |
+| `VECGEN_SHARED_NETWORK` | `aka-av` | 同一ホスト上の別の compose プロジェクトと共有する Docker ネットワークの名前 |
+| `VECGEN_LOG_LEVEL` | `info` | ログレベル |
+| `VECGEN_LOG_BUFFER` | `1000` | 管理API で返すためにメモリに保持するログの件数 |
+| `VECGEN_AUDIT_MAX` | `10000` | 監査ログの保持件数の上限 |
+| `VECGEN_VERSION` | `dev` | 起動ログと管理API の `/status` に出すバージョン（ビルドのときに埋め込む） |
 
 平文HTTP リスナーは、同一ホスト上のクライアント向けです。CK / IK が平文で流れるので、ループバック以外には公開しないでください。平文HTTP での払い出しは、平文HTTP を許可した加入者に限られます。
 
-Docker が公開したポートは ufw の規則を通りません。公開範囲は `AKA_AV_TLS_PUBLISH`、`AKA_AV_PLAIN_PUBLISH`、`AKA_ADMIN_PUBLISH` のアドレスで制御してください。
+Docker が公開したポートは ufw の規則を通りません。公開範囲は `VECGEN_AV_TLS_PUBLISH`、`VECGEN_AV_PLAIN_PUBLISH`、`VECGEN_ADMIN_PUBLISH` のアドレスで制御してください。
 
 ## 開発
 
@@ -171,7 +173,7 @@ docker run -d --rm --name aka-test-valkey -p 127.0.0.1:16379:6379 valkey/valkey:
 ```
 
 ```bash
-AKA_TEST_VALKEY_ADDR=127.0.0.1:16379 go test ./...
+VECGEN_TEST_VALKEY_ADDR=127.0.0.1:16379 go test ./...
 ```
 
 GitHub Actions（`.github/workflows/ci.yml`）で、push と pull request のたびに次を実行します。
@@ -188,7 +190,8 @@ GitHub Actions（`.github/workflows/ci.yml`）で、push と pull request のた
 
 ## ドキュメント
 
-- [設計概要](docs/design-overview.md)
+- [設計概要（MVP）](docs/design-overview.md)
+- [PoC の設計概要（今の作り）](docs/poc/design-overview.md)
 - [認証ベクターAPI](docs/openapi/av-api.yaml)
 - [管理API](docs/openapi/admin-api.yaml)
 - [データモデル](docs/data-model.md)

@@ -1,274 +1,345 @@
-# aka-only-server 設計概要
+# aka-vecgen 設計概要（下書き）
 
-- 状態: フェーズ1〜3 の実装に合わせて更新済み（2026-10-04）
-- 対象: aka-only-server 本体。システム全体の構成もここに記載する。
-- 関連: BFF / Web GUI 側の設計概要は web-gui-for-aka-only-server リポジトリの `docs/design-overview.md` を参照。
+- 作成日: 2026-10-25
+- 状態: 下書き。§17 の確認事項は 2026-10-25 にすべて推奨案で合意した（§3.2 の決定事項 1〜11）。
+- 置き場所: 2026-10-27（MVP セットの段階 1）に、aka-mvpset の `docs/nodes/aka-vecgen.md` から本リポジトリの `docs/design-overview.md` に移した。
+- 対象: 認証ベクターを作るノード aka-vecgen（もとは aka-only-server。以下「もとの実装」）。
+- 関連:
+  - aka-mvpset の[要件と構成の概要](https://github.com/oyaguma3/aka-mvpset/blob/main/docs/requirements-overview.md)（以下「概要」）: §5（配置）、§6.1・§6.3・§6.4（加入者のデータ・状態・台帳）、§10（一括投入）、§11（権限）、§12（鍵と秘密の値）、§13（ログ）、§15（バックアップ）、§17.1（改修）
+  - 認証ベクターAPI の契約（以下「契約」）: [av-api-contract.md](https://github.com/oyaguma3/aka-mvpset/blob/main/docs/av-api-contract.md)。とくに §16.1（aka-vecgen の改修 V1〜V7）
+  - もとの実装: aka-only-server。今の作りは本リポジトリの [`docs/poc/design-overview.md`](poc/design-overview.md)、[`docs/data-model.md`](data-model.md)、`docs/openapi/admin-api.yaml`（管理API 0.2.0）
+  - 手本にする実装: radsec-ca（KEK と鍵の暗号化 §6、管理クライアントのピン §9.1）、eapaka-node-provisioner（管理クライアントの認証、操作者・トレースID）
 
-旧実装（PostgreSQL + Gin + IP許可リスト）は流用せず、コードとドキュメントを削除したうえで全面的に作り直した。
+## 1. 位置づけ
 
-## 1. 目的と範囲
-
-指定した IMSI に対して Milenage による AKA 認証ベクターを払い出す API サーバー。EAP-AKA / EAP-AKA' の RADIUS サーバーなどがクライアントになる。
-
-- 提供するのは API のみ。GUI は持たず、特定の GUI 実装に依存しない。
-- 個人利用・検証用途を想定し、VPS に `git clone` して `docker compose up` で起動できる手軽さを優先する。
-- 加入者情報・鍵情報は平文保存または最低限の保護とする。
-
-対象外: OAuth2.0、NRF 連携、Milenage 以外のアルゴリズム、EPS-AKA（KASME）、5G-AKA（Kausf / XRES*）。
-
-## 2. 全体構成
+指定した IMSI の認証ベクターを Milenage で作って返すノード。データ面に aka-radius と並べて置く。
 
 ```
-[AVクライアント]                      [ブラウザ]
- (EAP-AKAサーバー等)                      │ HTTPS（VPN 越し）
-     │                                    ▼
-     │ mTLS または平文HTTP        web-gui-for-aka-only-server
-     │                           BFF + Web GUI
-     │                                    │ mTLS（管理用証明書）
-     ▼                                    ▼
-   認証ベクターAPI                      管理API
-   ───────────── aka-only-server ─────────────
-                          │
-                    Valkey（永続化）
+[aka-radius] ──mTLS（ノードの中の Docker のネットワーク）──> 認証ベクターAPI（8443）
+                                                             ─────── aka-vecgen ─────── Valkey（Ki・OPc は暗号化）
+[aka-provisioner] ──mTLS（サービス用の WireGuard）──────────> 管理API（9443）             KEK（ファイル）
+[運用者] ──SSH（運用用の WireGuard と踏み台）──> コマンド（AV クライアント、サーバー証明書、KEK）
 ```
 
-| リポジトリ | 責務 |
+- aka-vecgen は、IMSI ごとに鍵（Ki・OPc）・AMF・SQN・許可クライアント・状態を持つ（概要の決定事項 4）。テナントへの所属は持たない（aka-ossbss の台帳にある。決定事項 6）。
+- 認証ベクターAPI は契約（1.0.0）を実装する。aka-radius から見て、aka-vecgen は「同じ契約を実装した取得先」の 1 つにすぎない。
+- 管理API の呼び出し側は aka-provisioner だけで、全権として扱う。誰が何をしてよいか（役割）は aka-ossbss が決める（概要 §6.4、§11）。
+- 加入者のデータは aka-radius と独立に管理する（決定事項 6）。
+
+## 2. 範囲
+
+| 区分 | 内容 |
 |---|---|
-| aka-only-server | 認証ベクターAPI、管理API、Milenage / SQN 処理、加入者・クライアントのデータ |
-| web-gui-for-aka-only-server | BFF、Web GUI、ログインアカウントと権限。aka-only-server の管理 GUI 実装の1つ |
+| 対象 | Milenage による認証ベクターの生成（EAP-AKA、EAP-AKA'、UMTS-AKA）、SQN の管理と再同期、加入者の登録・変更・状態・削除、鍵の保存時の暗号化と KEK の入れ替え、AV クライアント（証明書のピン留め）、一括取得と一覧、監査ログとその書き出し |
+| 対象外 | 画面（web-gui-for-aka-only-server は MVP セットに含めない。概要 §17.2）、平文HTTP の認証ベクターAPI（§17 の B5）、OP の扱い（常に OPc）、Milenage 以外の方式、テナント・認可・セッション、一括投入のジョブ（aka-ossbss が 1 件ずつの API を呼ぶ。概要 §10.2）、冗長化 |
 
-2つのリポジトリは同一ホストでも別ホストでも動かせるようにする。両者の接点は管理API（mTLS）だけとする。
+## 3. 決定事項
 
-## 3. 技術方針
+### 3.1 概要と契約で決めたこと
 
-- 言語: Go 1.27.3。
-- 標準ライブラリを優先する。HTTP は `net/http`、TLS は `crypto/tls`、JSON は `encoding/json/v2`、ログは `log/slog`、設定は環境変数（`os.Getenv`）。
-- 外部依存は次に限る。
-  - `github.com/wmnsk/milenage`: Milenage 計算
-  - `github.com/valkey-io/valkey-go`: Valkey クライアント
-- プロジェクト全体で認める例外は、これに `golang.org/x/crypto`（BFF 側のパスワードハッシュ）を加えた3つとする。
-- module パス: `github.com/oyaguma3/aka-only-server`
-- データベース: Valkey。永続化して使う。
-- 配備: Docker Compose。ホスト OS は Debian を主対象とし、Ubuntu Server でも動く見込み。
-
-## 4. リスナー構成
-
-| リスナー | 用途 | 認証 | 既定 |
-|---|---|---|---|
-| AV / mTLS | 認証ベクターAPI | クライアント証明書必須。登録済み証明書のみ許可 | 有効 |
-| AV / 平文HTTP | 認証ベクターAPI | なし（匿名） | 無効 |
-| 管理 / mTLS | 管理API | クライアント証明書必須。静的設定された証明書のみ許可 | 管理クライアントを設定した場合だけ有効 |
-
-- TLS は Go アプリ自身で終端する。リバースプロキシは置かない。
-- AV / mTLS では、証明書なしの接続と未登録証明書の接続をどちらも拒否する。
-- AV / 平文HTTP は、AKA-RADIUS サーバーや TS.43 Entitlement Server などの AV 取得クライアントを同一ホストに併存させるケースのためのもの。CK/IK が平文で流れるため既定で無効とし、有効にする場合はバインド先をループバックや Docker 内部ネットワークに限定する。
-- AV 用と管理用でサーバー証明書・ポートを分ける。
-
-## 5. 認証ベクターAPI
-
-### 5.1 ベース仕様
-
-3GPP TS 29.503 Nudm_UEAuthentication の GenerateAv（HSS 連携用）をベースにする。
-
-```
-POST /nudm-ueau/v1/{supi}/hss-security-information/{hssAuthType}/generate-av
-```
-
-- `supi`: `imsi-<IMSI>` 形式。
-- リクエスト（HssAuthenticationInfoRequest）: `hssAuthType`、`numOfRequestedVectors`（1〜5）、`resynchronizationInfo`（`rand` / `auts`）、`anId`。
-- レスポンス（HssAuthenticationInfoResult）: `hssAuthenticationVectors`。
-- エラーは ProblemDetails（`application/problem+json`）で返す。
-- クライアントはトレースID を `X-Trace-ID` ヘッダーで渡せる。サーバーはそれを払い出しのログ（`trace_id`）に残し、応答の `X-Trace-ID` ヘッダーで返す。省略した場合や形式が違う場合は採番する。本PoCの vector-gateway が付けるトレースID と、1 回の認証の記録を突き合わせるため（管理API と同じ作法。認証ベクターAPI 0.2.0-draft、2026-10-12）。
-
-パス、項目名、値の範囲は TS 29.503 v18.4.0 の OpenAPI 定義で確認した。詳細は `docs/openapi/av-api.yaml` に定義する。
-
-### 5.2 対応する認証タイプ
-
-| パスの hssAuthType | ボディの hssAuthType | 返すベクター | 内容 |
-|---|---|---|---|
-| `eap-aka` | `EAP_AKA` | AvImsGbaEapAka | RAND、XRES、AUTN、CK、IK |
-| `umts-aka` | `UMTS_AKA` | AvImsGbaEapAka | RAND、XRES、AUTN、CK、IK |
-| `eap-aka-prime` | `EAP_AKA_PRIME` | AvEapAkaPrime | RAND、XRES、AUTN、CK'、IK' |
-
-- パスの `umts-aka` は TS 29.503 の列挙値にはない独自の拡張。
-- これ以外の認証タイプはエラーとする。
-
-### 5.3 AKA' の鍵導出
-
-- CK' / IK' は TS 33.402 Annex A.2（RFC 5448 / RFC 9048）の KDF で導出する。
-- Network Name は AVクライアントごとに設定できる。未設定のクライアントと平文HTTP の接続では `WLAN` を使う。
-- リクエストに `anId` が入っていた場合もサーバー側の設定値を使い、不一致ならエラーにする。不一致の要求では SQN を進めない。
-- AKA' では AMF の separation bit が 1 である必要がある。サーバーは加入者の AMF をそのまま使い、強制はしない。
-
-### 5.4 再同期
-
-`resynchronizationInfo` があれば再同期として扱う。AUTS の MAC-S を検証し、SQN_MS を取り出して加入者の SQN を置き換えたうえで、新しいベクターを生成する。
-
-## 6. SQN 管理
-
-SQN(48bit) = SEQ(43bit) || IND(5bit) とする。加算パターンは加入者ごとに指定する。
-
-| タイプ | 1ベクター生成時の動作 |
-|---|---|
-| +1 | SQN 全体を 1 加算する（IND を意識しない単純カウンター） |
-| +32 | SEQ を 1 加算し、IND は維持する |
-| +33 | SEQ を 1 加算し、IND も 1 加算する。IND が 31 から 0 に回るときは SEQ に桁上げする（整数として 33 を加算するのと同じ） |
-
-複数ベクター生成時は、バッチ内で IND を固定する（TS 33.102 Annex C の考え方）。
-
-| タイプ | n 個生成時の動作 | SQN の総加算量 |
+| # | 内容 | 出どころ |
 |---|---|---|
-| +1 | 1個ごとに +1 | n |
-| +32 | 1個ごとに +32 | 32n |
-| +33 | 1個目は +33、2個目以降は +32（IND は1個目の値で固定） | 33 + 32(n−1) |
+| 1 | IMSI ごとに鍵・許可クライアント・状態を持つ。同じ契約を実装した他のノードに差し替えられる | 概要の決定事項 4 |
+| 2 | 状態は Active / Inactive / Terminated。Terminated から Inactive に戻すのは専用の API で、理由を必須にする。Active は物理削除できない | 決定事項 7〜9、概要 §6.3 |
+| 3 | 鍵を書き込めるのは一括投入と、システム管理者の個別の登録だけ。鍵を画面に出さない。読み出しの API は既定で無効にする | 決定事項 16、概要 §12.2 |
+| 4 | Ki・OPc は AES-256-GCM で暗号化し、AAD に IMSI を入れる。KEK はファイル（Docker の secrets）で渡し、DB には KEK の識別子だけを持つ。radsec-ca の作りにそろえる | 概要 §12.1 |
+| 5 | 下流の管理クライアントは aka-provisioner だけ。一括取得（IMSI を 500 件まで。鍵を返さない）と一覧の索引を持つ | 概要 §6.4 |
+| 6 | 管理クライアントのピンを、再起動せずに読み直せるようにする | 概要 §12.3 |
+| 7 | MVP で変える API は新しい大きい版にし、PoC セットとの互換は持たせない（管理API は `/admin/v2`） | 段階 0 の進め方 S5 |
+| 8 | 認証ベクターAPI は契約に合わせる（一般的な拒否、ネットワーク名の照合を加入者を調べる前に、EAP-AKA' の `anId` を必須に） | 契約の決定事項 2・10、§16.1 |
+| 9 | ログの IMSI のマスクは既定でオフ（もとの実装もマスクしていない） | 決定事項 26 |
 
-- SQN は Valkey に整数で保存する。
-- 許可判定と SQN 更新は Lua スクリプトで1回の原子的な操作にまとめ、同時リクエストで同じ SQN が払い出されないようにする。
+### 3.2 本書で決めたこと
 
-## 7. クライアント識別とアクセス制御
-
-### 7.1 クライアント証明書（ピン留め方式）
-
-- CA は立てない。クライアント証明書の PEM を管理API経由で登録し、SHA-256 フィンガープリントで照合する。自己署名証明書で足りる。
-- TLS ハンドシェイクでは証明書の提示を必須とし、フィンガープリントが登録済みかつ有効なクライアントのものであることを確認する。有効期限も確認する。
-- 登録・削除・無効化は再起動なしで即時に反映する。クライアントの情報はメモリに持たず、ハンドシェイクとリクエストのたびに Valkey で確認する。
-- クライアントID は連番で発行し、再利用しない。
-
-### 7.2 加入者ごとの許可判定
-
-加入者は「許可クライアントID の集合」と「平文HTTP許可フラグ」を持つ。
-
-| 接続 | 判定 |
-|---|---|
-| mTLS、登録済み証明書 | クライアントID が加入者の許可集合に含まれていれば許可 |
-| mTLS、証明書なし・未登録証明書 | 接続を拒否 |
-| 平文HTTP | 加入者の平文HTTP許可フラグが立っていれば許可 |
-
-### 7.3 クライアント削除時の扱い
-
-- クライアントID を再利用しないため、削除後に加入者の許可集合へ古い ID が残っても、別のクライアントに許可が引き継がれることはない。
-- 残った ID の掃除は、削除処理の後に全加入者を走査して行う。安全性は掃除の完了に依存しない。
-- 走査と削除は 500 加入者ずつパイプラインでまとめて送る。1万加入者での実測は約 0.3 秒（WSL2 上の Valkey 9.1、AOF を書き込みごとに同期する設定）。
-
-## 8. 管理API
-
-認証ベクターAPIとは別のポート・別のサーバー証明書で提供する。契約は OpenAPI で定義し、`docs/` に置く。
-
-### 8.1 管理クライアント
-
-- 管理クライアント（BFF など）は、環境変数 `AKA_ADMIN_CLIENTS` に「識別名=証明書の SHA-256 フィンガープリント」の形で静的に設定する。
-- 管理クライアントが 1 つも設定されていなければ、管理API は起動しない。
-- 管理クライアントは全権として扱う。ユーザーや権限の概念はサーバー側に持たない。
-- 管理クライアントは操作者 ID を `X-Operator-Id` ヘッダーで渡し、サーバーはそれを監査ログに残す。省略した場合は管理クライアントの識別名だけが残る。
-- 管理クライアントはトレースID を `X-Trace-ID` ヘッダーで渡せる。サーバーはそれをログと監査ログに残し、応答の `X-Trace-ID` ヘッダーで返す。省略した場合や形式（印字可能 ASCII 1〜64 文字）が違う場合は採番する（16 進 32 桁）。本PoC（eapaka-radius-server-poc）の Provisioning API と作法を揃え、BFF や統合API（eapaka-node-provisioner）の操作と、このサーバーの記録を突き合わせられるようにする（管理API 0.2.0）。
-
-### 8.2 機能
-
-| 分類 | 機能 |
-|---|---|
-| 加入者 | 一覧（ページング、IMSI 前方一致）、件数、個別取得、登録、変更、削除 |
-| 加入者の鍵 | Ki / OPc の取得。通常の一覧・個別取得には含めず、専用の操作に分ける |
-| 状態 | バージョン、起動日時、加入者数、クライアント数、AV用サーバー証明書の期限 |
-| AVクライアント | 一覧、登録（証明書 PEM）、変更（名前、有効/無効、Network Name）、証明書の差し替え、削除 |
-| AV用サーバー証明書 | 現在の証明書の取得、登録（証明書と秘密鍵）、削除 |
-| ログ | 直近のサーバーログの取得（指定した番号以降） |
-| 監査ログ | 監査ログの取得 |
-
-- Ki / OPc の取得を別操作に分けるのは、GUI 側で権限に応じた出し分けをしやすくするため。
-- 証明書の差し替えはクライアントID を変えずに行う。証明書を更新しても、各加入者の許可クライアントの設定をやり直す必要がない。
-- 詳細は `docs/openapi/admin-api.yaml` に定義する。
-- 管理API用のサーバー証明書は管理APIの対象にしない。初回起動時に自己署名を自動生成して Valkey に保存し、作り直しはコマンド（`admin-cert reset`）で行う。
-
-### 8.3 AV用サーバー証明書
-
-- 自己署名または持ち込みとする。
-- 初回起動時に証明書がなければ自己署名を自動生成する。
-- 差し替えは再起動なしで反映する。
-- 削除は「自己署名を再生成してそれに戻す」動作とする。証明書のない状態は作らない。
-
-## 9. データモデル（Valkey）
-
-| キー | 型 | 内容 |
+| # | 内容 | 決定日 |
 |---|---|---|
-| `sub:{imsi}` | Hash | `ki`、`opc`、`sqn`（整数）、`amf`、`sqn_type`、`allow_plain`、`created_at`、`updated_at` |
-| `sub:{imsi}:clients` | Set | 許可クライアントID |
-| `subs` | Sorted Set | IMSI の索引。一覧のページングと前方一致検索に使う |
-| `client:{id}` | Hash | `name`、`cert_pem`、`fp_sha256`、`not_after`、`enabled`、`network_name`、`created_at` |
-| `clients` | Sorted Set | クライアントID の索引 |
-| `clientfp:{fp}` | String | フィンガープリントからクライアントID への索引 |
-| `seq:client` | String | クライアントID の発番カウンター |
-| `cfg:av_tls` | Hash | AV 用サーバー証明書と秘密鍵 |
-| `cfg:admin_tls` | Hash | 管理API 用サーバー証明書と秘密鍵 |
-| `audit` | Stream | 監査ログ。件数上限つき |
+| 1 | module パスは `github.com/oyaguma3/aka-vecgen`、コマンド名は `aka-vecgen`、環境変数の接頭辞は `VECGEN_`（§4。確認事項 B1） | 2026-10-25 |
+| 2 | 状態の値は小文字の `active` / `inactive` / `terminated`。変更は `PUT /admin/v2/subscribers/{imsi}/state`、Terminated からの戻しは `POST /admin/v2/subscribers/{imsi}/reinstate`（理由が必須）。登録では状態（`active` か `inactive`）を必須にする。aka-radius も同じ値と口にそろえる（§7、§10.2。B2） | 2026-10-25 |
+| 3 | Ki ‖ OPc を 1 つの暗号文（AAD は IMSI を含む文字列）にする。起動の確認は `cfg:kek_check` の復号で行う。`rotate-kek` は止めて行い、行ごとの KEK の識別子（`cred_kek`）でやり直せるようにする（§8。B3） | 2026-10-25 |
+| 4 | 登録の後に鍵を変える API は作らない。誤りは `inactive` → 削除 → 登録し直しで直す。鍵の読み出しは `VECGEN_KEY_EXPORT=true` のときだけ有効にする（§8.4。B4） | 2026-10-25 |
+| 5 | 平文HTTP のリスナーと加入者の `allowPlain` をなくす（§5、§6.1。B5。契約の決定事項 5） | 2026-10-25 |
+| 6 | AV クライアントと AV 用のサーバー証明書の書き込みはノードの上のコマンドで行い、管理API は読み出しだけにする（§9.3。B6） | 2026-10-25 |
+| 7 | 管理クライアントのピンはファイル（Docker の secrets）にして `SIGHUP` で読み直す。同じ識別名に新旧 2 つのフィンガープリントを書ける。aka-radius・aka-provisioner・radsec-ca も同じ作りにそろえる（§10.1。B7） | 2026-10-25 |
+| 8 | メモリーの中のログの口（`GET /logs`）をなくす（§10.2。B8） | 2026-10-25 |
+| 9 | 監査ログは Valkey の Stream に加えて、日ごとの追記だけの JSONL のファイルに書き、監視用の PC が取りに行く（§13.2。B9） | 2026-10-25 |
+| 10 | 認証ベクターAPI は、Valkey に届かないときに 503 `NF_CONGESTION`、他の中の誤りで 500 `SYSTEM_FAILURE` を返す（§9.1。B10） | 2026-10-25 |
+| 11 | aka-vecgen は `Idempotency-Key` を扱わない。登録の 409 と削除の 404 で「既にある」「ない」を返し、再送の判定は aka-provisioner に任せる（§10.1。B11） | 2026-10-25 |
 
-- Ki / OPc は平文で保存する。将来、環境変数の鍵で AES-GCM 暗号化する処理を後付けできる構造にしておく。
-- Valkey は AOF を有効にし `appendfsync always` とする。ポートは外部に公開せず、`requirepass` を設定する。
+## 4. 技術方針
 
-## 10. ログ
+- もとの実装の方針を引き継ぐ。言語は Go 1.27.3。標準ライブラリを優先する（`net/http`、`crypto/tls`、`crypto/aes`・`crypto/cipher`、`encoding/json/v2`、`log/slog`）。
+- 外部依存は `github.com/wmnsk/milenage` と `github.com/valkey-io/valkey-go` だけ（もとの実装と同じ）。
+- module パスは `github.com/oyaguma3/aka-vecgen`、コマンド名は `aka-vecgen`、環境変数の接頭辞は `VECGEN_`（§17 の B1）。
+- データベースは Valkey（単一ノード、AOF、`appendfsync always`）。
+- 配備は Docker Compose。コンテナは distroless の nonroot。KEK は Docker の secrets で渡す。
+- ブランチは `main` に直接コミットする（もとの実装と同じ。prefix なしの日本語の件名）。
 
-### 10.1 サーバーログ
+## 5. 待ち受け
 
-- `log/slog` で JSON を標準出力に出す。ローテーションは Docker に任せる。
-- 直近 N 件をメモリ上のリングバッファに保持し、管理APIで返す。再起動するとバッファは消える。
-- Ki、OPc、CK、IK、CK'、IK' はログに出さない。
-- 認証ベクター払い出しは、クライアントID とトレースID つきで記録する。
-- 管理API のリクエストは、処理を終えるたびに `admin request completed`（メソッド、パス、ステータス、所要時間、管理クライアント、操作者、トレースID、送信元アドレス）として記録する。管理 GUI が数秒ごとに呼ぶ `GET /logs` だけは debug レベルにする（info だと、取得した記録自体がログに積もり続けるため）。
+| 口 | ポート | 待ち受けるアドレス | 認証 |
+|---|---|---|---|
+| 認証ベクターAPI | 8443（HTTPS） | データ面のノードの中の Docker のネットワーク（aka-radius と共有する external のネットワーク）。ホストに公開しない | mTLS。AV クライアントの証明書のピン（§9） |
+| 管理API | 9443（HTTPS） | サービス用の WireGuard のアドレス（管理面の aka-provisioner から） | mTLS。管理クライアントのピン（§10.1） |
 
-### 10.2 監査ログ
+- もとの実装の平文HTTP のリスナー（8080）はなくす（§17 の B5）。
+- TLS は 1.2 以上。サーバー証明書は、AV 用と管理用を分ける（もとの実装と同じ。§9.3）。
+- Valkey はどこにも公開しない（compose の内部のネットワークだけ）。
 
-- 管理API経由の変更操作を記録する。対象は、加入者の登録・変更・削除、Ki / OPc の取得、AVクライアントの登録・変更・証明書の差し替え・削除、AV用サーバー証明書の登録・削除。
-- 記録する項目は、日時、操作者 ID、管理クライアント、操作、対象、変更内容、トレースID。
-- 加入者の登録と削除では、その時点の SQN、AMF、SQN 増加タイプを記録する。削除して再登録することで SQN / AMF を実質的に変更した操作を、後から追跡できるようにするため。
-- Ki / OPc は値を記録せず、変更の有無だけを記録する。
-- 標準出力に加えて Valkey の Stream に保存し、再起動後も残す。件数に上限を設け、古いものから捨てる。
+## 6. 加入者のデータ
 
-## 11. 配備
+### 6.1 `sub:{imsi}`（Hash）
 
-- `compose.yaml` に aka-only-server と Valkey を定義する。設定は `.env` で与える。
-- コンテナイメージは静的リンクのバイナリを最小のベースイメージに載せる。
-- compose の healthcheck は `aka-only-server healthcheck` で、有効なリスナー（認証ベクターAPI、平文HTTP、管理API）に TCP で接続できるかを確かめる。mTLS のためクライアント証明書がないと要求を送れないので、待ち受けているかどうかの確認にとどめる（Valkey の状態などはログと管理API の `/status` で見る）。
-- healthcheck は接続してすぐ切るので、サーバーは TLS のハンドシェイクの前の切断（`http: TLS handshake error from 127.0.0.1:…: EOF`）を記録する。ループバックからのこの切断だけは DEBUG にし、ログとメモリのログのバッファが healthcheck で埋まらないようにする。外からの接続は別のアドレスから届くので、WARN のまま残る（2026-10-12）。
-- 停止の合図からリスナーを閉じ終えるまで最大 10 秒かかるので、compose の `stop_grace_period` を 20 秒にする（Docker の既定の猶予 10 秒では強制終了と重なる）。
-- Docker が公開したポートは ufw の規則を通らないため、公開範囲は `ports` のバインド先アドレスで制御する。
-- 同一ホスト上の別の compose プロジェクト（AKA-RADIUS サーバー、BFF など）とは、共有の Docker ネットワークでつなぐ。Valkey はこのネットワークに出さない。
+| フィールド | 形式 | 内容 | もとの実装からの変更 |
+|---|---|---|---|
+| `cred` | バイト列（nonce ‖ 暗号文） | Ki ‖ OPc（32 バイト）を AES-256-GCM で暗号化したもの（§8） | `ki`・`opc` の平文をやめる |
+| `cred_kek` | 16 進 16 桁 | `cred` を暗号化した KEK の識別子（`rotate-kek` のやり直しに使う。§8.3） | 新しく足す |
+| `sqn` | 10 進整数（0〜2^48−1） | 最後に払い出した SQN | — |
+| `amf` | 16 進 4 桁 | AMF（既定 `8000`。EAP-AKA' では separation bit が 1 である必要がある） | — |
+| `sqn_type` | `inc1` / `inc32` / `inc33` | SQN の方式（既定 `inc32`。§6.4） | — |
+| `state` | `active` / `inactive` / `terminated` | 状態（§7） | 新しく足す |
+| `state_changed_at` | 日時 | 状態が最後に変わった日時（登録を含む） | 新しく足す |
+| `created_at`、`updated_at` | 日時 | 登録・最終変更の日時（SQN の払い出しでは変えない） | — |
 
-## 12. テスト
+- `allow_plain` はなくす（平文HTTP をなくすため）。
+- 許可クライアント（`sub:{imsi}:clients`、Set）と IMSI の索引（`subs`、Sorted Set）は、もとの実装のまま。
 
-- Milenage は TS 35.208 4.3 のテストセット（20 件）で検証する。
-- AKA' の鍵導出は RFC 5448 Appendix C のテストベクター（4 件）で検証する。
-- 再同期、各 SQN パターン、複数ベクター生成は単体テストで固定する。
-- 同時リクエストで SQN が重複しないことを、実際の Valkey を使う結合テストで確認する。
-- 管理API は、ハンドラーからストアまでを実際の Valkey に対して通しで確かめる。
-- Valkey を使うテストは、接続先を環境変数（`AKA_TEST_VALKEY_ADDR`）で指定したときだけ実行する。
-- GitHub Actions の CI が、push と pull request のたびにテスト（Valkey の結合テストを含む）、イメージのビルド、README の手順の通し確認を実行する。依存と標準ライブラリの既知の脆弱性は、別のワークフローが push と pull request のたびと毎週 govulncheck で調べる。
-- 管理API と BFF の契約は、web-gui-for-aka-only-server の CI がこのリポジトリの main を相手に確かめる。管理API を変えたときは、そちらの CI も確かめる。
+### 6.2 一覧と一括取得
 
-## 13. 開発フェーズ
+- 一覧は `subs` を辞書順にたどる（カーソルつき、1 ページ 500 件まで。IMSI の前方一致で絞れる）。台帳との突き合わせ（概要 §6.4）は、これで全件をたどる（20 万件で 400 ページ）。
+- 一括取得は、IMSI を 500 件まで受け取り、あるものの中身（鍵を除く）と、ない IMSI の一覧を返す（パイプラインでまとめて読む）。
 
-1. AKA コア + Valkey + 認証ベクターAPI（mTLS / 平文HTTP）
-2. 管理API
-3. BFF / GUI（web-gui-for-aka-only-server）
+### 6.3 大きさの見込み
 
-フェーズ1では、加入者とクライアントをコマンド（`aka-only-server subscriber` / `client`）で投入して EAP-AKA サーバーから試せる。使い方は `README.md` を参照。
+- 加入者 1 件あたり、Hash（約 9 フィールド）・Set・索引で 0.5 KB 前後。20 万件で約 100 MB（規模の試験で測る）。
+- SQN の払い出しは認証 1 回に 1 回の書き込みで、ピーク 50 TPS でも AOF の `always` で足りる（もとの実装と同じ判断）。
 
-| フェーズ | 状態 |
+### 6.4 SQN の方式の指針
+
+運用ガイドに次の指針を書く（概要 §6.1）。
+
+| 方式 | 使いどころ |
 |---|---|
-| 1 | 実装済み |
-| 2 | 実装済み |
-| 3 | 実装済み（web-gui-for-aka-only-server） |
+| `inc32`（既定） | IND を固定し SEQ だけを進める。同じ USIM を別の生成源（他の HSS など）でも認証するときは、生成源ごとに別の IND を使うこの方式を選ぶ |
+| `inc33` | 払い出しのたびに IND も進める。USIM の IND ごとの配列を使い切る作り（TS 33.102 Annex C） |
+| `inc1` | IND を意識しない単純なカウンター。他の生成源と同じ USIM を共有しない試験用 |
 
-### 13.1 今後の課題
+## 7. 状態
 
-| 項目 | 内容 |
+### 7.1 規則（概要 §6.3）
+
+| 状態 | 認証ベクター | 変更（AMF・SQN・方式・許可クライアント） | 物理削除 | 移れる先 |
+|---|---|---|---|---|
+| `active` | 払い出す | できる | できない（409 `SUBSCRIBER_ACTIVE`） | `inactive`、`terminated` |
+| `inactive` | 一般的な拒否 | できる | できる | `active`、`terminated` |
+| `terminated` | 一般的な拒否 | できない（409 `SUBSCRIBER_TERMINATED`） | できる | `inactive`（専用の API。理由が必須） |
+
+- 登録のときの状態は `active` か `inactive` を必ず指定する（`terminated` では登録できない）。
+- 状態の移り方は API が強制する（概要 §6.3）。同じ状態への変更は何もせず 200 を返し、監査ログには残す。
+- 払い出しの Lua で `state` を確かめ、`active` でなければ一般的な拒否（理由 `inactive` / `terminated`）にする。
+
+### 7.2 Terminated から戻す
+
+- `POST /admin/v2/subscribers/{imsi}/reinstate`（本文: `reason`、1〜500 文字）。`terminated` から `inactive` にする。他の状態では 409 `STATE_TRANSITION_NOT_ALLOWED`。
+- 使えるのがシステム管理者だけであることは aka-ossbss が守る（aka-vecgen は管理クライアントを全権として扱う）。理由と操作者は監査ログに残す。
+
+## 8. 鍵の保管
+
+### 8.1 暗号化（概要 §12.1、radsec-ca §6 にそろえる）
+
+- Ki ‖ OPc（32 バイト）を AES-256-GCM で暗号化して `cred` に入れる。nonce は 12 バイトの乱数。AAD は `aka-vecgen/sub/<IMSI>`（暗号文を別の加入者の行に移しても復号できないようにする）。
+- KEK は 32 バイトの乱数で、ファイル（`VECGEN_KEK_FILE`。Docker の secrets）で渡す。Valkey には KEK の識別子（SHA-256 の先頭 8 バイトの 16 進）を `cfg:kek` に持つ。
+- 払い出しの Lua は `cred` をそのまま返し、Go の側で復号して Milenage に渡す。平文の鍵はメモリーに持ち続けない（要求ごとに復号して捨てる）。
+- 一括投入の待ちのファイルの暗号化（概要 §12.1）は aka-ossbss の役目で、aka-vecgen には関係しない。
+
+### 8.2 起動のときの確認
+
+- KEK のファイルを読めない、32 バイトでない、識別子が `cfg:kek` と合わない場合は起動しない。
+- 初めての起動（`cfg:kek` がない）では識別子を書き込む。
+- 加入者を全件復号して確かめることはしない（20 万件を毎回読むのは重い）。代わりに `cfg:kek_check`（決まった値を KEK で暗号化したもの）を復号できることを確かめる。
+
+### 8.3 KEK の入れ替えとバックアップ
+
+- `aka-vecgen rotate-kek -old <ファイル> -new <ファイル>`: 止めてから、全加入者の `cred` を 500 件ずつ読み、新しい KEK で暗号化し直して書く。途中で止まっても続きからやり直せるように、各行に KEK の識別子を持たせる（`cred_kek`）。
+- `aka-vecgen gen-kek -out <ファイル>`: KEK を作る。
+- バックアップは Valkey の AOF と定期のスナップショット（概要 §15）。暗号文なので、KEK と一緒に置かない。**KEK を失うと全加入者の鍵を入れ直すことになる**（運用ガイドに書く）。
+
+### 8.4 鍵の書き込みと読み出し
+
+- 鍵を書き込めるのは登録（`POST /admin/v2/subscribers`）だけ。登録の後に鍵を変える API は作らない（§17 の B4）。鍵を誤って登録したときは、`inactive` にして削除し、登録し直す（SQN と AMF は登録のときに指定できる）。
+- 鍵の読み出し（`GET /admin/v2/subscribers/{imsi}/keys`）は `VECGEN_KEY_EXPORT=true` のときだけ有効にする（既定は無効で 404）。別の生成源への移し替えのような、まれな作業のためだけに残す。使うたびに監査ログに残す（値は残さない）。
+- 鍵はログ・監査ログ・応答（読み出しの API を除く）に出さない。
+
+## 9. 認証ベクターAPI
+
+### 9.1 契約への合わせ方
+
+契約 §16.1 の V1〜V7 を行う。
+
+| # | 内容 |
 |---|---|
-| 認証ベクターAPI のトレースID | 対応済み（2026-10-12。§5.1、認証ベクターAPI 0.2.0-draft） |
+| V1 | 未登録・許可なし・`inactive`・`terminated`・AUTS の誤り・無効のクライアントを、固定の本文の 403 にする。理由はログに残す（`not_found`、`client_not_allowed`、`inactive`、`terminated`、`auts_invalid`、`client_disabled`） |
+| V2 | 判定の順: TLS でのクライアントの識別 → 形の検査 → ネットワーク名の照合（クライアントの `network_name` だけで行う）→ 払い出しの Lua（有無・許可・状態）→ 再同期なら AUTS |
+| V3 | `EAP_AKA_PRIME` で `anId` がなければ 400 `MANDATORY_IE_MISSING` |
+| V4 | クライアントの `network_name` を「許す値」として扱う（空なら `WLAN`） |
+| V5 | `Cache-Control: no-store` を付ける。Valkey に届かないときは 503 `NF_CONGESTION`、他の中の誤りは 500 `SYSTEM_FAILURE`（§17 の B10） |
+| V6 | 平文HTTP のリスナーをなくす（§17 の B5） |
+| V7 | 適合試験（契約 §14）を CI で走らせる |
 
-## 14. ドキュメント
+- Milenage、AKA' の鍵の導出、SQN の方式、払い出しの Lua の原子性、再同期の 2 段の手順は、もとの実装のまま（もとの実装の設計概要 §5・§6、データモデル §4）。
 
-| ファイル | 内容 |
+### 9.2 払い出しの Lua の変更
+
+もとの実装のデータモデル §4.2 の手順を、次のように変える。
+
+1. `sub:{imsi}` がなければ `NOT_FOUND`。
+2. クライアントが無効なら `CLIENT_DISABLED`、許可クライアントに含まれなければ `FORBIDDEN`。
+3. `state` が `active` でなければ `INACTIVE` / `TERMINATED`。
+4. 再同期の SQN があれば置き換え、n 個分 SQN を進める。
+5. `OK` とともに、加算前の SQN、`cred`、`amf`、`sqn_type` を返す。
+
+- ネットワーク名の照合は Lua から外し、Go の側で加入者を調べる前に行う（V2）。
+- 1〜3 はどれも SQN を進めず、Go の側で同じ一般的な拒否にする。
+
+### 9.3 AV クライアントとサーバー証明書
+
+- AV クライアントの作り（証明書のピン留め、ID を使い回さない、ハンドシェイクと要求ごとに Valkey で確かめる、削除の後の掃除）は、もとの実装のまま（もとの実装の設計概要 §7）。
+- MVP の AV クライアントは aka-radius の 1 つ（と、試験のときの適合試験のクライアント）。
+- AV クライアントと AV 用のサーバー証明書の登録・変更・削除は、ノードの上のコマンド（`aka-vecgen client ...`、`aka-vecgen av-cert ...`）で行い、管理API からは一覧の読み出しだけにする（§17 の B6）。aka-ossbss は、加入者の許可クライアントを選ぶために一覧を読む。
+- AV 用のサーバー証明書は、もとの実装と同じく初めての起動で自己署名を作る。aka-radius の取得先の登録簿には、この証明書を「サーバーの CA」として登録する。SAN は `VECGEN_AV_TLS_HOSTS`（例 `aka-vecgen`）。
+
+## 10. 管理API（9443、mTLS）
+
+項目の詳細は OpenAPI（`docs/openapi/admin-api.yaml`、2.0.0）で、段階 2 の実装のときに書く。本書では口の一覧と方針だけを書く。
+
+### 10.1 認証・ヘッダー・エラー
+
+- mTLS 必須。管理クライアントは、ファイル（`VECGEN_ADMIN_CLIENTS_FILE`。1 行に `識別名=フィンガープリント`）で設定する。`SIGHUP` で読み直す（再起動しない。概要 §12.3）。同じ識別名に 2 つのフィンガープリントを並べて書けるようにし、証明書の入れ替えの間は新旧の両方を受ける（§17 の B7）。読み直しは、ファイルが読めない・形が違うときは前の設定のまま続け、ログに出す。
+- 管理API のサーバー証明書は、もとの実装と同じく自己署名（`aka-vecgen admin-cert reset` で作り直す）。
+- `X-Operator-Id`（操作者）と `X-Trace-ID`（受け取るか採番し、応答で返す）は、もとの実装の管理API 0.2.0 と同じ。
+- エラーは ProblemDetails（`application/problem+json`）で、`cause` に理由の符号を入れる。主な `cause`: `VALIDATION_ERROR`、`SUBSCRIBER_NOT_FOUND`、`SUBSCRIBER_EXISTS`、`SUBSCRIBER_ACTIVE`、`SUBSCRIBER_TERMINATED`、`STATE_TRANSITION_NOT_ALLOWED`、`UNKNOWN_CLIENT`、`KEY_EXPORT_DISABLED`、`SYSTEM_FAILURE`。
+- `Idempotency-Key` は aka-vecgen では扱わない。再送の判定は aka-provisioner が行う（provisioner の設計概要 §9.2）。登録は「既にあれば 409 `SUBSCRIBER_EXISTS`」、削除は「なければ 404」なので、一括投入の「既にある」「ない IMSI は飛ばす」（概要 §10.3）はこの応答で数えられる。
+
+### 10.2 口
+
+すべて `/admin/v2` の下。
+
+| 口 | 内容 | もとの実装からの変更 |
+|---|---|---|
+| `GET /status` | 版、契約の版、起動日時、KEK の識別子、加入者の数、AV クライアントの数、AV 用・管理用のサーバー証明書の期限、管理クライアントの識別名と読み直しの日時 | KEK・契約の版・管理クライアントを足す |
+| `GET /subscribers` | 一覧（カーソル、1 ページ 500 件まで、IMSI の前方一致）。`total` を返す | 状態を含める |
+| `POST /subscribers/batch-get` | 一括取得（本文: `imsis` 500 件まで）。応答: `items`（あるもの）と `notFound` | 新しく足す |
+| `POST /subscribers` | 登録（本文: `imsi`、`ki`、`opc`、`state`（`active` / `inactive`）、`amf`、`sqn`、`sqnType`、`allowedClientIds`） | `state` を必須に、`allowPlain` をなくす |
+| `GET /subscribers/{imsi}` | 個別の取得（鍵を除く） | 状態を含める |
+| `PATCH /subscribers/{imsi}` | 変更（`amf`、`sqn`、`sqnType`、`allowedClientIds`）。`terminated` では 409 | 鍵と `allowPlain` を外す |
+| `PUT /subscribers/{imsi}/state` | 状態の変更（本文: `state`、任意の `reason`）。`terminated` からは 409（`reinstate` を使う） | 新しく足す |
+| `POST /subscribers/{imsi}/reinstate` | `terminated` から `inactive` に戻す（本文: `reason` 必須） | 新しく足す |
+| `DELETE /subscribers/{imsi}` | 物理削除。`active` では 409 | 状態の検査を足す |
+| `GET /subscribers/{imsi}/keys` | 鍵の読み出し。既定で無効（§8.4） | 既定で無効に |
+| `GET /clients`、`GET /clients/{clientId}` | AV クライアントの一覧と詳細（証明書の期限、`networkName`、有効・無効） | 書き込みの口をなくす（§9.3） |
+| `GET /av-server-certificate` | AV 用のサーバー証明書（PEM と期限） | 書き込みの口をなくす |
+| `GET /audit-logs` | 監査ログ（新しい順、ページ送り） | — |
+
+- もとの実装の `GET /logs`（メモリーの中の直近のログ）はなくす（§17 の B8）。ログは概要 §13 の仕組みで取りに行く。
+- 加入者の応答の形（例）: `imsi`、`state`、`stateChangedAt`、`amf`、`sqn`、`sqnType`、`allowedClientIds`、`createdAt`、`updatedAt`。`stateChangedAt` は、課金レコードの状態の事実の漏れを台帳との突き合わせで補うとき（課金レコードの決定事項 13）の手がかりにする。
+
+## 11. 主な流れ
+
+### 11.1 認証（aka-radius から）
+
+1. aka-radius が契約の GenerateAv を呼ぶ（1 ベクター）。
+2. aka-vecgen はクライアントを識別し、形とネットワーク名を確かめ、払い出しの Lua で有無・許可・状態を確かめて SQN を進める。
+3. `cred` を復号し、Milenage でベクターを作り（EAP-AKA' では CK'・IK' を導出し）、返す。
+4. 拒否なら、理由をログに残して一般的な拒否を返す。
+
+### 11.2 登録（一括投入・個別の登録）
+
+1. aka-ossbss（一括投入のジョブか、システム管理者の画面）が aka-provisioner を通して `POST /admin/v2/subscribers` を呼ぶ。
+2. aka-vecgen は鍵を暗号化して登録し、監査ログに残す（鍵は残さない。SQN・AMF・方式・状態を残す）。
+3. 既にあれば 409。aka-ossbss は「既にある」として数える。
+
+### 11.3 状態の変更と物理削除
+
+- 状態の変更は aka-ossbss の操作から aka-provisioner を通して届く。aka-radius の状態とは独立に変わる（概要 §6.3）。
+- 一括の物理削除は、`active` の IMSI を検証の段で除いてから（概要 §10.3）1 件ずつ `DELETE` を呼ぶ。
+
+### 11.4 台帳との突き合わせ
+
+- aka-ossbss が定期的に `GET /admin/v2/subscribers` で全件をたどり、台帳の有無と状態を比べる（概要 §6.4）。
+
+## 12. 設定（環境変数）
+
+| 名前 | 内容 | 既定 |
+|---|---|---|
+| `VECGEN_VALKEY_ADDR` / `VECGEN_VALKEY_PASSWORD` | Valkey | — |
+| `VECGEN_KEK_FILE` | KEK のファイル | `/run/secrets/kek` |
+| `VECGEN_AV_ADDR` / `VECGEN_AV_TLS_HOSTS` | 認証ベクターAPI の待ち受けとサーバー証明書の SAN | `:8443` / — |
+| `VECGEN_ADMIN_ADDR` / `VECGEN_ADMIN_TLS_HOSTS` | 管理API の待ち受けとサーバー証明書の SAN | `:9443` / — |
+| `VECGEN_ADMIN_CLIENTS_FILE` | 管理クライアントのピンのファイル | `/run/secrets/admin-clients` |
+| `VECGEN_KEY_EXPORT` | 鍵の読み出しの API を有効にする | `false` |
+| `VECGEN_AUDIT_MAX` | 監査ログの Stream の件数の上限 | 100000 |
+| `VECGEN_AUDIT_DIR` | 監査ログの書き出し先（§13.2） | `/data/audit` |
+| `VECGEN_LOG_LEVEL` | ログの段階 | `INFO` |
+
+コマンド: `aka-vecgen serve`（既定）、`gen-kek`、`rotate-kek`、`client`（AV クライアントの登録・証明書の差し替え・有効と無効・ネットワーク名・削除）、`av-cert`、`admin-cert`、`fingerprint`、`subscriber`（試験と初めの確認のための個別の操作。鍵を標準入力から受ける）、`healthcheck`。
+
+- コマンドは `docker compose exec` で、動いているコンテナの中で使う（Valkey と KEK に届くため）。使ったことは監査ログに残す（操作者は `cli`）。
+
+## 13. ログと監査ログ
+
+### 13.1 ログ
+
+- JSON（`log/slog`）で標準出力に出す。`event_id` と `trace_id` を付ける（例: `AV_ISSUED`、`AV_REJECTED`（`reason` つき）、`AV_FAILED`、`ADMIN_REQUEST`、`ADMIN_CLIENTS_RELOADED`、`KEK_MISMATCH`）。
+- 認証ベクターの払い出しは、IMSI・クライアント ID・認証タイプ・再同期の有無・`trace_id` を残す。IMSI はマスクしない（決定事項 26）。
+- Ki・OPc・CK・IK・CK'・IK'・XRES・KEK はログに出さない。
+- 集め方は概要 §13 の仕組み（ノードで圧縮して 2 週間、監視用の PC が取りに行く）による。
+
+### 13.2 監査ログ
+
+- 残すもの: 加入者の登録・変更・状態の変更・Terminated からの戻し・削除、鍵の読み出し、AV クライアントとサーバー証明書の操作（コマンド）、KEK の入れ替え、管理クライアントの読み直し。項目はもとの実装と同じ（日時、操作者、管理クライアント、操作、対象、変更の内容、`trace_id`）に、理由（状態の変更）を足す。
+- 置き場所は 2 つ: Valkey の Stream（件数の上限つき。管理API で見る）と、日ごとの追記だけのファイル（`VECGEN_AUDIT_DIR` の `audit-YYYYMMDD.jsonl`）。ファイルは日が変わったら圧縮し、監視用の PC が取りに行く（概要 §13。Stream から押し出される前に残すため。§17 の B9）。ノードでは 2 週間持つ。
+- 一括投入の行ごとの操作は、`trace_id` にジョブの ID が入る（概要 §10.4）。
+
+## 14. 配備
+
+- compose に aka-vecgen と Valkey を置く。データ面のノードで aka-radius と並べる。
+- aka-radius と共有する Docker のネットワーク（external）に、aka-vecgen の認証ベクターAPI だけを出す。Valkey は出さない。
+- 管理API はサービス用の WireGuard のアドレスにだけ結び付ける（`ports` のバインド先と nftables の `DOCKER-USER`。概要 §5.3）。
+- KEK と管理クライアントのピンのファイルは Docker の secrets で渡す。ピンのファイルを書き換えたら `docker compose kill -s HUP aka-vecgen` で読み直す。
+- healthcheck は、もとの実装と同じく待ち受けに TCP でつなげるかを確かめる。
+
+## 15. 試験
+
+| 層 | 内容 |
 |---|---|
-| `docs/design-overview.md` | 本書 |
-| `docs/openapi/av-api.yaml` | 認証ベクターAPI の仕様 |
-| `docs/openapi/admin-api.yaml` | 管理API の仕様 |
-| `docs/data-model.md` | Valkey のキー設計と Lua スクリプトの仕様 |
-| `docs/operation-guide.md` | 導入、証明書の作成と登録、同一ホストのクライアントとの接続、バックアップ、更新手順 |
+| 単体 | Milenage（TS 35.208 の 20 件）、AKA' の鍵の導出（RFC 5448 の 4 件）、SQN の方式、再同期、状態の移り方の規則、暗号化（違う KEK・違う AAD の行は復号できない、`cfg:kek_check`）、管理クライアントのピンのファイルの読み直し（形の誤りで前の設定が残る） |
+| 結合（実際の Valkey） | 払い出しの Lua（状態、無効のクライアント、同時の要求で SQN が重ならない）、管理API（状態の変更と戻し、Active の削除の拒否、Terminated の変更の拒否、一括取得、一覧のカーソル）、`rotate-kek`（途中で止めてやり直す） |
+| 適合試験 | 契約 §14 の C1〜C11 を CI で走らせる（aka-mvpset の `conformance/av-api/` を固定のコミットで取る） |
+| 規模 | 加入者 20 万件を入れ、毎秒 100 要求で p99 200 ミリ秒（契約 §11.1）、一覧の全件のたどりの時間、Valkey のメモリー（概要 §16.1） |
+
+## 16. 進め方（案）
+
+| 段階 | 内容 | 終わりの確かめ |
+|---|---|---|
+| 1 | リポジトリ `aka-vecgen` を作り、aka-only-server の履歴ごと移す。改名だけ（module パス、コマンド、環境変数の接頭辞、Docker のネットワーク名、イメージ名、文書） | 今の CI が通る |
+| 2-1 | 状態と払い出しの Lua の変更、認証ベクターAPI を契約に合わせる（V1〜V6）、平文HTTP をなくす | 単体・結合、適合試験 |
+| 2-2 | 鍵の暗号化、KEK（起動の確認、`gen-kek`、`rotate-kek`） | 単体・結合 |
+| 2-3 | 管理API 2.0.0（状態の口、一括取得、鍵の口の既定の無効、書き込みの口をコマンドへ、`/logs` をなくす）、ピンのファイルと `SIGHUP`、監査ログの書き出し | 結合、aka-provisioner との契約の試験 |
+| 2-4 | 運用ガイド（導入、KEK とバックアップ、SQN の方式の指針、鍵を誤ったときの登録し直し）、README | 手元の compose、simwifi で aka-radius から認証 |
+
+- 2-1 は aka-radius の改修（契約 §16.2）と同じ時期に行い、aka-radius との通しを早く確かめる。
+
+## 17. 確認事項（2026-10-25 にすべて推奨案で合意。§3.2 の決定事項 1〜11）
+
+| # | 事項 | 推奨 | 理由 |
+|---|---|---|---|
+| B1 | 名前（段階 1） | module パス `github.com/oyaguma3/aka-vecgen`、コマンド `aka-vecgen`、環境変数の接頭辞 `VECGEN_` | もとの `AKA_` は aka-radius など他のノードの名前と紛れる。radsec-ca の `CA_` と同じく、ノードを表す短い接頭辞にする |
+| B2 | 状態の値と口 | 値は小文字の `active` / `inactive` / `terminated`。変更は `PUT …/state`、戻しは `POST …/reinstate`（理由が必須）。登録で状態を必須にする（§7、§10.2） | 本PoC の Provisioning API 0.4.0 の `active` / `suspended` と同じ書き方。戻しを別の口にすると、システム管理者だけに許す操作を aka-ossbss と aka-provisioner で見分けやすい。aka-radius も同じ値と口にそろえる（aka-radius の設計概要で確かめる） |
+| B3 | 鍵の暗号化の形 | Ki ‖ OPc を 1 つの暗号文にし、AAD は IMSI を含む文字列。起動の確認は `cfg:kek_check` の復号。`rotate-kek` は止めて行い、行ごとの KEK の識別子でやり直せるようにする（§8） | 1 つにすると Ki と OPc の取り違えが起きない。radsec-ca は起動のときに全 CA を復号するが、20 万件では重いので確認用の値で代える |
+| B4 | 登録の後の鍵の変更 | API を作らない。誤りは `inactive` → 削除 → 登録し直しで直す。鍵の読み出しは `VECGEN_KEY_EXPORT=true` のときだけ（§8.4） | 鍵の通り道を登録の 1 つに限る（概要 §12.2）。同じ IMSI で鍵が変わるのは誤りの直しくらいで、まれ |
+| B5 | 平文HTTP（契約の決定事項 5） | 平文HTTP のリスナーと加入者の `allowPlain` をなくす | 契約の外で、IMSI ごとの許可クライアントが効かない。データ面の同じノードの aka-radius も mTLS でつなぐ |
+| B6 | AV クライアントと AV 用のサーバー証明書の管理 | 書き込みはノードの上のコマンドで行い、管理API は読み出しだけにする（§9.3） | MVP の AV クライアントは aka-radius の 1 つで、変えるのは証明書の更新くらい。aka-ossbss に画面と権限を作るより小さく、鍵に準じる設定を管理面から変えられないようにできる。aka-ossbss は許可クライアントを選ぶために一覧を読む |
+| B7 | 管理クライアントのピンの読み直し | ファイル（Docker の secrets）にして `SIGHUP` で読み直す。同じ識別名に新旧 2 つを書ける（§10.1） | 概要 §12.3。環境変数は再起動しないと変わらない。aka-radius・aka-provisioner・radsec-ca も同じ作りにそろえる（各設計概要で確かめる） |
+| B8 | メモリーの中のログの口（`GET /logs`） | なくす | もとは aka-only-server の画面のためのもので、MVP の画面は aka-vecgen のログを見せない。ログは概要 §13 の仕組みで集める |
+| B9 | 監査ログの書き出し（概要 §13） | Stream に加えて、日ごとの追記だけの JSONL のファイルに書き、監視用の PC が取りに行く（§13.2） | Stream は件数の上限で押し出される。標準出力のログと分けておくと、ログの経路（aka-radius の設計概要の決定事項 10 で Fluent Bit に決めた）がどうなっても監査ログを確実に残せる |
+| B10 | 503 を返す場合 | Valkey に届かないときは 503 `NF_CONGESTION`、他の中の誤りは 500 `SYSTEM_FAILURE` | どちらも呼び出し側では一時的な誤りだが、ログと監視で「保存先の障害」と「作りの誤り」を分けられる |
+| B11 | 一括投入の重複と冪等 | aka-vecgen は `Idempotency-Key` を扱わない。登録の 409・削除の 404 で「既にある」「ない」を返し、再送の判定は aka-provisioner に任せる（§10.1） | 再送の判定は aka-provisioner に既にあり（同じ管理クライアントからの 24 時間の再送）、下流の 2 か所で持つ意味がない |

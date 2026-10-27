@@ -17,12 +17,12 @@ import (
 
 	"github.com/valkey-io/valkey-go"
 
-	"github.com/oyaguma3/aka-only-server/internal/adminapi"
-	"github.com/oyaguma3/aka-only-server/internal/certs"
-	"github.com/oyaguma3/aka-only-server/internal/config"
-	"github.com/oyaguma3/aka-only-server/internal/logbuf"
-	"github.com/oyaguma3/aka-only-server/internal/server"
-	"github.com/oyaguma3/aka-only-server/internal/store"
+	"github.com/oyaguma3/aka-vecgen/internal/adminapi"
+	"github.com/oyaguma3/aka-vecgen/internal/certs"
+	"github.com/oyaguma3/aka-vecgen/internal/config"
+	"github.com/oyaguma3/aka-vecgen/internal/logbuf"
+	"github.com/oyaguma3/aka-vecgen/internal/server"
+	"github.com/oyaguma3/aka-vecgen/internal/store"
 )
 
 // このテストは、ハンドラーからストアまでを実際の Valkey に対して通しで確かめる。
@@ -43,11 +43,11 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	addr := os.Getenv("AKA_TEST_VALKEY_ADDR")
+	addr := os.Getenv("VECGEN_TEST_VALKEY_ADDR")
 	if addr == "" {
-		t.Skip("AKA_TEST_VALKEY_ADDR is not set")
+		t.Skip("VECGEN_TEST_VALKEY_ADDR is not set")
 	}
-	password := os.Getenv("AKA_TEST_VALKEY_PASSWORD")
+	password := os.Getenv("VECGEN_TEST_VALKEY_PASSWORD")
 
 	raw, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}, Password: password, SelectDB: testDB, DisableCache: true})
 	if err != nil {
@@ -541,7 +541,7 @@ func TestAVServerCertificate(t *testing.T) {
 
 	r := e.do("GET", "/av-server-certificate", nil)
 	initial := decode[serverCert](t, r, http.StatusOK)
-	if initial.Source != "self-signed" || initial.Subject != "CN=aka-only-server" || len(initial.FingerprintSHA256) != 64 {
+	if initial.Source != "self-signed" || initial.Subject != "CN=aka-vecgen" || len(initial.FingerprintSHA256) != 64 {
 		t.Errorf("initial = %+v", initial)
 	}
 	if bytes.Contains(r.body, []byte("PRIVATE KEY")) {

@@ -1,8 +1,8 @@
 # データモデル（Valkey）
 
 - 状態: ドラフト
-- 対象: aka-only-server が Valkey に持つデータと、その操作手順。
-- 関連: [設計概要](design-overview.md)、[認証ベクターAPI](openapi/av-api.yaml)、[管理API](openapi/admin-api.yaml)
+- 対象: aka-vecgen が Valkey に持つデータと、その操作手順。
+- 関連: [設計概要（PoC。今の作り）](poc/design-overview.md)、[認証ベクターAPI](openapi/av-api.yaml)、[管理API](openapi/admin-api.yaml)
 
 ## 1. 前提
 

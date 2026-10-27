@@ -58,7 +58,7 @@ func Open(ctx context.Context, o Options) (*Store, error) {
 		InitAddress: []string{o.Addr},
 		Password:    o.Password,
 		SelectDB:    o.DB,
-		ClientName:  "aka-only-server",
+		ClientName:  "aka-vecgen",
 		// 単一ノード前提で、クライアント側キャッシュは使わない。
 		DisableCache: true,
 	})

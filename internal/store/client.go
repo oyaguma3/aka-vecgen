@@ -10,7 +10,7 @@ import (
 
 	"github.com/valkey-io/valkey-go"
 
-	"github.com/oyaguma3/aka-only-server/internal/certs"
+	"github.com/oyaguma3/aka-vecgen/internal/certs"
 )
 
 // Client は AVクライアント（認証ベクターAPI のクライアント）。

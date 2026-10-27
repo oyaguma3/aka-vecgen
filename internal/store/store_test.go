@@ -11,22 +11,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/oyaguma3/aka-only-server/internal/aka"
-	"github.com/oyaguma3/aka-only-server/internal/certs"
+	"github.com/oyaguma3/aka-vecgen/internal/aka"
+	"github.com/oyaguma3/aka-vecgen/internal/certs"
 )
 
 // 結合テストは実際の Valkey に接続する。接続先を環境変数で指定したときだけ実行する。
 //
-//	AKA_TEST_VALKEY_ADDR=127.0.0.1:16379 AKA_TEST_VALKEY_PASSWORD=... go test ./internal/store/
+//	VECGEN_TEST_VALKEY_ADDR=127.0.0.1:16379 VECGEN_TEST_VALKEY_PASSWORD=... go test ./internal/store/
 //
 // テストは論理データベース 1 番の全データを消すので、専用の Valkey を使うこと。
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
-	addr := os.Getenv("AKA_TEST_VALKEY_ADDR")
+	addr := os.Getenv("VECGEN_TEST_VALKEY_ADDR")
 	if addr == "" {
-		t.Skip("AKA_TEST_VALKEY_ADDR is not set")
+		t.Skip("VECGEN_TEST_VALKEY_ADDR is not set")
 	}
-	s, err := Open(t.Context(), Options{Addr: addr, Password: os.Getenv("AKA_TEST_VALKEY_PASSWORD"), DB: 1})
+	s, err := Open(t.Context(), Options{Addr: addr, Password: os.Getenv("VECGEN_TEST_VALKEY_PASSWORD"), DB: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

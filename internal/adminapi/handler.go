@@ -14,9 +14,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/oyaguma3/aka-only-server/internal/logbuf"
-	"github.com/oyaguma3/aka-only-server/internal/store"
-	"github.com/oyaguma3/aka-only-server/internal/traceid"
+	"github.com/oyaguma3/aka-vecgen/internal/logbuf"
+	"github.com/oyaguma3/aka-vecgen/internal/store"
+	"github.com/oyaguma3/aka-vecgen/internal/traceid"
 )
 
 const maxBodyBytes = 256 << 10

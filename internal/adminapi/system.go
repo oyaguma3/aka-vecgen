@@ -7,9 +7,9 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/oyaguma3/aka-only-server/internal/certs"
-	"github.com/oyaguma3/aka-only-server/internal/logbuf"
-	"github.com/oyaguma3/aka-only-server/internal/store"
+	"github.com/oyaguma3/aka-vecgen/internal/certs"
+	"github.com/oyaguma3/aka-vecgen/internal/logbuf"
+	"github.com/oyaguma3/aka-vecgen/internal/store"
 )
 
 // ---- 状態 ----

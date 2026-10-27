@@ -13,10 +13,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/oyaguma3/aka-only-server/internal/avapi"
-	"github.com/oyaguma3/aka-only-server/internal/certs"
-	"github.com/oyaguma3/aka-only-server/internal/config"
-	"github.com/oyaguma3/aka-only-server/internal/store"
+	"github.com/oyaguma3/aka-vecgen/internal/avapi"
+	"github.com/oyaguma3/aka-vecgen/internal/certs"
+	"github.com/oyaguma3/aka-vecgen/internal/config"
+	"github.com/oyaguma3/aka-vecgen/internal/store"
 )
 
 const (
@@ -104,7 +104,7 @@ func (s *Server) loadCertificate(ctx context.Context, slot store.CertSlot, hosts
 
 func selfSigned(hosts []string) (certPEM, keyPEM []byte, err error) {
 	certPEM, keyPEM, err = certs.SelfSigned(certs.SelfSignedOptions{
-		CommonName: "aka-only-server",
+		CommonName: "aka-vecgen",
 		Hosts:      hosts,
 		ValidFor:   selfSignedValidFor,
 	})
