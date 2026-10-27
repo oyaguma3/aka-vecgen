@@ -94,10 +94,13 @@ jobs:
       - name: 認証ベクターの取得（eap-aka / umts-aka / eap-aka-prime）
         run: |
           get() {
+            # EAP-AKA' では anId（ネットワーク名）が必須（認証ベクターAPI の契約 §6.4）。
+            extra=""
+            if [ "$2" = EAP_AKA_PRIME ]; then extra=',"anId":"WLAN"'; fi
             curl -sS --fail-with-body --retry 10 --retry-delay 2 --retry-all-errors \
               --cacert server.pem --cert radius.pem -X POST \
               "https://localhost:8443/nudm-ueau/v1/imsi-440100123456789/hss-security-information/$1/generate-av" \
-              -d "{\"hssAuthType\":\"$2\",\"numOfRequestedVectors\":$3}"
+              -d "{\"hssAuthType\":\"$2\",\"numOfRequestedVectors\":$3$extra}"
           }
           check() {
             # 要求した数のベクターがあり、鍵（CK / IK または CK' / IK'）が入っていること。
@@ -119,3 +122,58 @@ jobs:
       - name: ログ（失敗時）
         if: failure()
         run: docker compose logs --no-color
+
+  conformance:
+    name: 認証ベクターAPI の適合試験
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      valkey:
+        image: valkey/valkey:9.1.2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # 適合試験（aka-mvpset の conformance/av-api）のコミット。契約や適合試験を変えたら、その main のコミットに更新する。
+      MVPSET_REF: 3477e863b52b65a851cd453d08b180b1bba83208
+      VECGEN_VALKEY_ADDR: localhost:6379
+      VECGEN_AV_TLS_ADDR: 127.0.0.1:18443
+      VECGEN_AV_TLS_HOSTS: localhost,127.0.0.1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: oyaguma3/aka-mvpset
+          ref: ${{ env.MVPSET_REF }}
+          path: aka-mvpset
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: ビルド
+        run: |
+          git -C aka-mvpset log -1 --format='aka-mvpset: %h %s'
+          go build -o "$RUNNER_TEMP/aka-vecgen" ./cmd/aka-vecgen
+          go -C aka-mvpset/conformance/av-api build -o "$RUNNER_TEMP/av-conformance" ./cmd/av-conformance
+      - name: 試験用のクライアントと加入者の投入
+        working-directory: ${{ runner.temp }}
+        run: sh "$GITHUB_WORKSPACE/aka-mvpset/conformance/av-api/fixtures/aka-vecgen.sh" out ./av-conformance ./aka-vecgen
+      - name: aka-vecgen の起動
+        working-directory: ${{ runner.temp }}
+        run: |
+          nohup ./aka-vecgen serve > vecgen.log 2>&1 &
+          for i in $(seq 1 30); do
+            ./aka-vecgen healthcheck 2>/dev/null && ./aka-vecgen av-cert > server.pem && exit 0
+            sleep 1
+          done
+          exit 1
+      - name: 適合試験
+        working-directory: ${{ runner.temp }}
+        run: ./av-conformance -url https://127.0.0.1:18443/nudm-ueau/v1 -ca server.pem -cert-a out/client-a.pem -cert-b out/client-b.pem
+      - name: ログ（失敗時）
+        if: failure()
+        working-directory: ${{ runner.temp }}
+        run: cat vecgen.log

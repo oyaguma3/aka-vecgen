@@ -7,6 +7,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -154,8 +155,8 @@ func TestGenerateUMTSAKA(t *testing.T) {
 }
 
 func TestGenerateEAPAKAPrime(t *testing.T) {
+	// anId は EAP-AKA' で必須（契約 §6.4）。省略は TestGenerateRejectsBadRequests で確かめる。
 	for _, body := range []string{
-		`{"hssAuthType":"EAP_AKA_PRIME","numOfRequestedVectors":2}`,
 		`{"hssAuthType":"EAP_AKA_PRIME","numOfRequestedVectors":2,"anId":"ETHERNET"}`,
 	} {
 		f := &fakeAllocator{sqnType: aka.SQNInc33, networkName: "ETHERNET"}
@@ -220,6 +221,9 @@ func TestGenerateResync(t *testing.T) {
 	f = &fakeAllocator{sqn: 64, sqnType: aka.SQNInc32}
 	rec = post(t, newTestHandler(f), basePath+"eap-aka/generate-av", body(bad))
 	checkProblem(t, rec, http.StatusForbidden, causeAuthRejected)
+	if got := strings.TrimSpace(rec.Body.String()); got != genericBody {
+		t.Errorf("bad AUTS: body = %s, want %s", got, genericBody)
+	}
 	if len(f.calls) != 1 || f.sqn != 64 {
 		t.Errorf("after bad AUTS: calls = %d, sqn = %d", len(f.calls), f.sqn)
 	}
@@ -269,6 +273,8 @@ func TestGenerateRejectsBadRequests(t *testing.T) {
 			`{"hssAuthType":"EAP_AKA","numOfRequestedVectors":1,"resynchronizationInfo":{"rand":"` + hex32 + `","auts":"00"}}`, 400, causeOptionalIEIncorrect},
 		{"empty anId", basePath + "eap-aka-prime/generate-av",
 			`{"hssAuthType":"EAP_AKA_PRIME","numOfRequestedVectors":1,"anId":""}`, 400, causeOptionalIEIncorrect},
+		{"no anId for EAP-AKA'", basePath + "eap-aka-prime/generate-av",
+			`{"hssAuthType":"EAP_AKA_PRIME","numOfRequestedVectors":1}`, 400, causeMandatoryIEMissing},
 	}
 	for _, tt := range tests {
 		f := &fakeAllocator{sqnType: aka.SQNInc32, networkName: "WLAN"}
@@ -282,15 +288,28 @@ func TestGenerateRejectsBadRequests(t *testing.T) {
 	}
 }
 
+// genericBody は一般的な拒否の固定の本文（契約 §9.2）。
+const genericBody = `{"title":"Forbidden","status":403,"cause":"AUTHENTICATION_REJECTED"}`
+
 func TestGenerateMapsAllocatorErrors(t *testing.T) {
+	// 加入者に依る拒否は、どの理由でも同じ本文（detail なし）にする。
+	for _, err := range []error{store.ErrNotFound, store.ErrForbidden, store.ErrClientDisabled, store.ErrInactive, store.ErrTerminated} {
+		f := &fakeAllocator{err: err}
+		rec := post(t, newTestHandler(f), basePath+"eap-aka/generate-av", `{"hssAuthType":"EAP_AKA","numOfRequestedVectors":1}`)
+		checkProblem(t, rec, http.StatusForbidden, causeAuthRejected)
+		if got := strings.TrimSpace(rec.Body.String()); got != genericBody {
+			t.Errorf("%v: body = %s, want %s", err, got, genericBody)
+		}
+	}
+
 	tests := []struct {
 		err    error
 		status int
 		cause  string
 	}{
-		{store.ErrNotFound, 404, causeUserNotFound},
-		{store.ErrForbidden, 403, causeAuthRejected},
 		{errors.New("valkey is down: secret detail"), 500, causeSystemFailure},
+		// 保存先に届かないときは 503（設計概要の決定事項 10）。
+		{&net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused: secret detail")}, 503, causeNFCongestion},
 	}
 	for _, tt := range tests {
 		f := &fakeAllocator{err: tt.err}
@@ -355,6 +374,17 @@ func TestTraceID(t *testing.T) {
 		}
 		if !strings.Contains(logs.String(), `"trace_id":"`+got+`"`) {
 			t.Errorf("log does not contain the generated trace id %q: %s", got, logs.String())
+		}
+	}
+}
+
+// TestCacheControl は、ベクターを返す応答にも誤りの応答にも Cache-Control: no-store を付けることを確かめる（契約 §6.3）。
+func TestCacheControl(t *testing.T) {
+	for _, body := range []string{`{"hssAuthType":"EAP_AKA","numOfRequestedVectors":1}`, `{`} {
+		f := &fakeAllocator{sqnType: aka.SQNInc32, networkName: "WLAN"}
+		rec := post(t, newTestHandler(f), basePath+"eap-aka/generate-av", body)
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("body %s: Cache-Control = %q, want no-store", body, got)
 		}
 	}
 }

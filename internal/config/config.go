@@ -20,8 +20,6 @@ type Config struct {
 
 	// AVTLSAddr は認証ベクターAPI の mTLS リスナーの待ち受けアドレス。
 	AVTLSAddr string
-	// AVPlainAddr は認証ベクターAPI の平文HTTP リスナーの待ち受けアドレス。空なら無効。
-	AVPlainAddr string
 	// AVTLSHosts は、AV 用の自己署名サーバー証明書を生成するときに SAN へ入れるホスト名と IP アドレス。
 	AVTLSHosts []string
 
@@ -47,7 +45,6 @@ func Load() (Config, error) {
 		ValkeyAddr:     cmp.Or(os.Getenv("VECGEN_VALKEY_ADDR"), "valkey:6379"),
 		ValkeyPassword: os.Getenv("VECGEN_VALKEY_PASSWORD"),
 		AVTLSAddr:      cmp.Or(os.Getenv("VECGEN_AV_TLS_ADDR"), ":8443"),
-		AVPlainAddr:    os.Getenv("VECGEN_AV_PLAIN_ADDR"),
 		AVTLSHosts:     splitList(cmp.Or(os.Getenv("VECGEN_AV_TLS_HOSTS"), "localhost,127.0.0.1")),
 		AdminAddr:      cmp.Or(os.Getenv("VECGEN_ADMIN_ADDR"), ":9443"),
 		AdminTLSHosts:  splitList(cmp.Or(os.Getenv("VECGEN_ADMIN_TLS_HOSTS"), "localhost,127.0.0.1")),

@@ -71,16 +71,15 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	h := &adminapi.Handler{
-		Store:          st,
-		Certs:          srv,
-		Logs:           logs,
-		Log:            log,
-		MgmtClient:     func(*http.Request) string { return "test-bff" },
-		Version:        "test",
-		BootID:         "boot-1",
-		StartedAt:      time.Now().UTC(),
-		AVPlainEnabled: true,
-		AuditMaxLen:    1000,
+		Store:       st,
+		Certs:       srv,
+		Logs:        logs,
+		Log:         log,
+		MgmtClient:  func(*http.Request) string { return "test-bff" },
+		Version:     "test",
+		BootID:      "boot-1",
+		StartedAt:   time.Now().UTC(),
+		AuditMaxLen: 1000,
 	}
 	return &env{t: t, h: h.Routes(), store: st, log: log}
 }
@@ -106,7 +105,7 @@ func (e *env) do(method, path string, body any) response {
 		}
 		rd = bytes.NewReader(data)
 	}
-	req := httptest.NewRequest(method, "/admin/v1"+path, rd)
+	req := httptest.NewRequest(method, "/admin/v2"+path, rd)
 	req.Header.Set("X-Operator-Id", "alice")
 	rec := httptest.NewRecorder()
 	e.h.ServeHTTP(rec, req)
@@ -154,10 +153,11 @@ func wantProblem(t *testing.T, r response, status int, cause string) []string {
 
 type subscriber struct {
 	IMSI             string    `json:"imsi"`
+	State            string    `json:"state"`
+	StateChangedAt   time.Time `json:"stateChangedAt"`
 	SQN              string    `json:"sqn"`
 	AMF              string    `json:"amf"`
 	SQNType          string    `json:"sqnType"`
-	AllowPlain       bool      `json:"allowPlain"`
 	AllowedClientIDs []int64   `json:"allowedClientIds"`
 	CreatedAt        time.Time `json:"createdAt"`
 	UpdatedAt        time.Time `json:"updatedAt"`
@@ -219,14 +219,14 @@ func TestSubscriberLifecycle(t *testing.T) {
 	c1, c2 := e.addClient("c1"), e.addClient("c2")
 	const imsi = "440100123456789"
 
-	// 登録。省略した項目には既定値が入る。
-	r := e.do("POST", "/subscribers", map[string]any{"imsi": imsi, "ki": strings.ToUpper(testKi), "opc": testOPc, "allowedClientIds": []int64{c2.ID, c1.ID, c1.ID}})
+	// 登録。状態は必須で、省略した項目には既定値が入る。
+	r := e.do("POST", "/subscribers", map[string]any{"imsi": imsi, "ki": strings.ToUpper(testKi), "opc": testOPc, "state": "active", "allowedClientIds": []int64{c2.ID, c1.ID, c1.ID}})
 	sub := decode[subscriber](t, r, http.StatusCreated)
-	if sub.IMSI != imsi || sub.SQN != "000000000000" || sub.AMF != "8000" || sub.SQNType != "inc32" || sub.AllowPlain ||
+	if sub.IMSI != imsi || sub.State != "active" || sub.StateChangedAt.IsZero() || sub.SQN != "000000000000" || sub.AMF != "8000" || sub.SQNType != "inc32" ||
 		!slices.Equal(sub.AllowedClientIDs, []int64{c1.ID, c2.ID}) || sub.CreatedAt.IsZero() {
 		t.Errorf("created = %+v", sub)
 	}
-	if loc := r.header.Get("Location"); loc != "/admin/v1/subscribers/"+imsi {
+	if loc := r.header.Get("Location"); loc != "/admin/v2/subscribers/"+imsi {
 		t.Errorf("Location = %q", loc)
 	}
 	// 通常の応答には Ki と OPc を含めない。
@@ -234,7 +234,7 @@ func TestSubscriberLifecycle(t *testing.T) {
 		t.Errorf("create response leaks keys: %s", r.body)
 	}
 
-	wantProblem(t, e.do("POST", "/subscribers", map[string]any{"imsi": imsi, "ki": testKi, "opc": testOPc}), http.StatusConflict, "SUBSCRIBER_ALREADY_EXISTS")
+	wantProblem(t, e.do("POST", "/subscribers", map[string]any{"imsi": imsi, "ki": testKi, "opc": testOPc, "state": "active"}), http.StatusConflict, "SUBSCRIBER_ALREADY_EXISTS")
 
 	r = e.do("GET", "/subscribers/"+imsi, nil)
 	if got := decode[subscriber](t, r, http.StatusOK); got.IMSI != imsi || bytes.Contains(r.body, []byte(testKi)) {
@@ -248,35 +248,64 @@ func TestSubscriberLifecycle(t *testing.T) {
 	}
 
 	// 変更。指定した項目だけが変わる。
-	r = e.do("PATCH", "/subscribers/"+imsi, map[string]any{"sqn": "0000000003E0", "allowPlain": true, "allowedClientIds": []int64{c2.ID}})
+	r = e.do("PATCH", "/subscribers/"+imsi, map[string]any{"sqn": "0000000003E0", "allowedClientIds": []int64{c2.ID}})
 	sub = decode[subscriber](t, r, http.StatusOK)
-	if sub.SQN != "0000000003e0" || !sub.AllowPlain || sub.AMF != "8000" || !slices.Equal(sub.AllowedClientIDs, []int64{c2.ID}) {
+	if sub.SQN != "0000000003e0" || sub.AMF != "8000" || !slices.Equal(sub.AllowedClientIDs, []int64{c2.ID}) {
 		t.Errorf("patched = %+v", sub)
 	}
-	if keys := decode[map[string]string](t, e.do("GET", "/subscribers/"+imsi+"/keys", nil), http.StatusOK); keys["ki"] != testKi {
-		t.Errorf("ki changed by an unrelated patch: %v", keys)
-	}
-	r = e.do("PATCH", "/subscribers/"+imsi, map[string]any{"ki": strings.Repeat("ab", 16), "amf": "9001", "sqnType": "inc33"})
+	r = e.do("PATCH", "/subscribers/"+imsi, map[string]any{"amf": "9001", "sqnType": "inc33"})
 	if sub = decode[subscriber](t, r, http.StatusOK); sub.AMF != "9001" || sub.SQNType != "inc33" || sub.SQN != "0000000003e0" {
 		t.Errorf("patched = %+v", sub)
 	}
-	if keys := decode[map[string]string](t, e.do("GET", "/subscribers/"+imsi+"/keys", nil), http.StatusOK); keys["ki"] != strings.Repeat("ab", 16) || keys["opc"] != testOPc {
-		t.Errorf("keys after patch = %v", keys)
-	}
 
-	// 不正な変更は何も書き換えない。
+	// 鍵と状態は変更の口では変えられない。不正な変更は何も書き換えない。
+	if got := wantProblem(t, e.do("PATCH", "/subscribers/"+imsi, map[string]any{"ki": strings.Repeat("ab", 16), "opc": testOPc, "state": "inactive"}), http.StatusBadRequest, "OPTIONAL_IE_INCORRECT"); !slices.Equal(got, []string{"ki", "opc", "state"}) {
+		t.Errorf("invalidParams = %v", got)
+	}
+	if keys := decode[map[string]string](t, e.do("GET", "/subscribers/"+imsi+"/keys", nil), http.StatusOK); keys["ki"] != testKi {
+		t.Errorf("ki changed by a rejected patch: %v", keys)
+	}
 	if got := wantProblem(t, e.do("PATCH", "/subscribers/"+imsi, map[string]any{"allowedClientIds": []int64{9999}}), http.StatusBadRequest, "CLIENT_NOT_FOUND"); !slices.Equal(got, []string{"allowedClientIds"}) {
 		t.Errorf("invalidParams = %v", got)
 	}
-	if got := wantProblem(t, e.do("PATCH", "/subscribers/"+imsi, `{"amf":null,"sqn":"xyz","bogus":1,"allowPlain":"yes"}`), http.StatusBadRequest, "OPTIONAL_IE_INCORRECT"); !slices.Equal(got, []string{"allowPlain", "amf", "bogus", "sqn"}) {
+	if got := wantProblem(t, e.do("PATCH", "/subscribers/"+imsi, `{"amf":null,"sqn":"xyz","bogus":1,"allowPlain":true}`), http.StatusBadRequest, "OPTIONAL_IE_INCORRECT"); !slices.Equal(got, []string{"allowPlain", "amf", "bogus", "sqn"}) {
 		t.Errorf("invalidParams = %v", got)
 	}
 	wantProblem(t, e.do("PATCH", "/subscribers/"+imsi, `{}`), http.StatusBadRequest, "MANDATORY_IE_MISSING")
 	wantProblem(t, e.do("PATCH", "/subscribers/"+imsi, `[1]`), http.StatusBadRequest, "INVALID_MSG_FORMAT")
-	wantProblem(t, e.do("PATCH", "/subscribers/440100000000000", map[string]any{"allowPlain": true}), http.StatusNotFound, "USER_NOT_FOUND")
-	if got := decode[subscriber](t, e.do("GET", "/subscribers/"+imsi, nil), http.StatusOK); got.AMF != "9001" || !got.AllowPlain {
+	wantProblem(t, e.do("PATCH", "/subscribers/440100000000000", map[string]any{"amf": "8000"}), http.StatusNotFound, "USER_NOT_FOUND")
+	if got := decode[subscriber](t, e.do("GET", "/subscribers/"+imsi, nil), http.StatusOK); got.AMF != "9001" || got.State != "active" {
 		t.Errorf("after rejected patches: %+v", got)
 	}
+
+	// active は物理削除できない。
+	wantProblem(t, e.do("DELETE", "/subscribers/"+imsi, nil), http.StatusConflict, "SUBSCRIBER_ACTIVE")
+
+	// 状態の変更。同じ状態への変更は 200 で何もしない。
+	wantProblem(t, e.do("PUT", "/subscribers/"+imsi+"/state", map[string]any{}), http.StatusBadRequest, "MANDATORY_IE_MISSING")
+	wantProblem(t, e.do("PUT", "/subscribers/"+imsi+"/state", map[string]any{"state": "suspended"}), http.StatusBadRequest, "MANDATORY_IE_INCORRECT")
+	wantProblem(t, e.do("PUT", "/subscribers/"+imsi+"/state", map[string]any{"state": "inactive", "reason": strings.Repeat("あ", 501)}), http.StatusBadRequest, "OPTIONAL_IE_INCORRECT")
+	wantProblem(t, e.do("PUT", "/subscribers/440100000000000/state", map[string]any{"state": "inactive"}), http.StatusNotFound, "USER_NOT_FOUND")
+	if got := decode[subscriber](t, e.do("PUT", "/subscribers/"+imsi+"/state", map[string]any{"state": "inactive", "reason": "保守"}), http.StatusOK); got.State != "inactive" {
+		t.Errorf("after state change: %+v", got)
+	}
+	if got := decode[subscriber](t, e.do("PUT", "/subscribers/"+imsi+"/state", map[string]any{"state": "inactive"}), http.StatusOK); got.State != "inactive" {
+		t.Errorf("after same state: %+v", got)
+	}
+	if got := decode[subscriber](t, e.do("PUT", "/subscribers/"+imsi+"/state", map[string]any{"state": "terminated"}), http.StatusOK); got.State != "terminated" {
+		t.Errorf("after terminate: %+v", got)
+	}
+
+	// terminated は変更できず、戻すのは reinstate だけ（理由が必須）。
+	wantProblem(t, e.do("PATCH", "/subscribers/"+imsi, map[string]any{"amf": "8000"}), http.StatusConflict, "SUBSCRIBER_TERMINATED")
+	wantProblem(t, e.do("PUT", "/subscribers/"+imsi+"/state", map[string]any{"state": "active"}), http.StatusConflict, "STATE_TRANSITION_NOT_ALLOWED")
+	if got := wantProblem(t, e.do("POST", "/subscribers/"+imsi+"/reinstate", map[string]any{"reason": " "}), http.StatusBadRequest, "MANDATORY_IE_MISSING"); !slices.Equal(got, []string{"reason"}) {
+		t.Errorf("invalidParams = %v", got)
+	}
+	if got := decode[subscriber](t, e.do("POST", "/subscribers/"+imsi+"/reinstate", map[string]any{"reason": "誤って解約した"}), http.StatusOK); got.State != "inactive" {
+		t.Errorf("after reinstate: %+v", got)
+	}
+	wantProblem(t, e.do("POST", "/subscribers/"+imsi+"/reinstate", map[string]any{"reason": "もう一度"}), http.StatusConflict, "STATE_TRANSITION_NOT_ALLOWED")
 
 	// 削除。
 	if r := e.do("DELETE", "/subscribers/"+imsi, nil); r.status != http.StatusNoContent {
@@ -297,28 +326,35 @@ func TestSubscriberLifecycle(t *testing.T) {
 	}
 	want := []string{
 		"client.create", "client.create", "subscriber.create",
-		"subscriber.keys.read", "subscriber.update", "subscriber.keys.read",
-		"subscriber.update", "subscriber.keys.read", "subscriber.delete",
+		"subscriber.keys.read", "subscriber.update", "subscriber.update", "subscriber.keys.read",
+		"subscriber.state", "subscriber.state", "subscriber.state", "subscriber.reinstate", "subscriber.delete",
 	}
 	if !slices.Equal(actions, want) {
 		t.Fatalf("audit actions = %v, want %v", actions, want)
 	}
-	// 登録と削除には、その時点の SQN / AMF / SQN 増加タイプが残る。
-	if d := audits[2].Detail; d["sqn"] != "000000000000" || d["amf"] != "8000" || d["sqnType"] != "inc32" {
+	// 登録と削除には、その時点の状態・SQN・AMF・SQN 増加タイプが残る。
+	if d := audits[2].Detail; d["state"] != "active" || d["sqn"] != "000000000000" || d["amf"] != "8000" || d["sqnType"] != "inc32" {
 		t.Errorf("create detail = %v", d)
 	}
-	if d := audits[8].Detail; d["sqn"] != "0000000003e0" || d["amf"] != "9001" || d["sqnType"] != "inc33" || audits[8].Target != imsi {
+	if d := audits[11].Detail; d["state"] != "inactive" || d["sqn"] != "0000000003e0" || d["amf"] != "9001" || d["sqnType"] != "inc33" || audits[11].Target != imsi {
 		t.Errorf("delete detail = %v", d)
 	}
-	// 変更には前後の値が残る。Ki は値ではなく変更の有無だけ。
+	// 変更には前後の値が残る。
 	if d := fmt.Sprint(audits[4].Detail["sqn"]); !strings.Contains(d, "000000000000") || !strings.Contains(d, "0000000003e0") {
 		t.Errorf("update detail sqn = %v", d)
 	}
-	if d := audits[6].Detail; d["kiChanged"] != true || d["opcChanged"] != nil {
-		t.Errorf("key update detail = %v", d)
+	// 状態の変更には前後の状態と理由が残る。同じ状態への変更には unchanged が付く。
+	if d := audits[7].Detail; fmt.Sprint(d["state"]) != "map[from:active to:inactive]" || d["reason"] != "保守" || d["unchanged"] != nil {
+		t.Errorf("state detail = %v", d)
+	}
+	if d := audits[8].Detail; d["unchanged"] != true {
+		t.Errorf("unchanged state detail = %v", d)
+	}
+	if d := audits[10].Detail; fmt.Sprint(d["state"]) != "map[from:terminated to:inactive]" || d["reason"] != "誤って解約した" {
+		t.Errorf("reinstate detail = %v", d)
 	}
 	raw := e.do("GET", "/audit-logs", nil).body
-	if bytes.Contains(raw, []byte(testKi)) || bytes.Contains(raw, []byte(testOPc)) || bytes.Contains(raw, []byte(strings.Repeat("ab", 16))) {
+	if bytes.Contains(raw, []byte(testKi)) || bytes.Contains(raw, []byte(testOPc)) {
 		t.Errorf("audit log leaks keys: %s", raw)
 	}
 }
@@ -331,12 +367,12 @@ func TestCreateSubscriberValidation(t *testing.T) {
 		cause  string
 		params []string
 	}{
-		{"missing required", map[string]any{"sqn": "000000000000"}, "MANDATORY_IE_MISSING", []string{"imsi", "ki", "opc"}},
-		{"bad required", map[string]any{"imsi": "12ab", "ki": "00", "opc": testOPc}, "MANDATORY_IE_INCORRECT", []string{"imsi", "ki"}},
-		{"bad optional", map[string]any{"imsi": "44010", "ki": testKi, "opc": testOPc, "sqn": "1", "amf": "80000", "sqnType": "inc2", "allowedClientIds": []int64{0}},
+		{"missing required", map[string]any{"sqn": "000000000000"}, "MANDATORY_IE_MISSING", []string{"imsi", "ki", "opc", "state"}},
+		{"bad required", map[string]any{"imsi": "12ab", "ki": "00", "opc": testOPc, "state": "terminated"}, "MANDATORY_IE_INCORRECT", []string{"imsi", "ki", "state"}},
+		{"bad optional", map[string]any{"imsi": "44010", "ki": testKi, "opc": testOPc, "state": "active", "sqn": "1", "amf": "80000", "sqnType": "inc2", "allowedClientIds": []int64{0}},
 			"OPTIONAL_IE_INCORRECT", []string{"allowedClientIds", "amf", "sqn", "sqnType"}},
-		{"unknown client", map[string]any{"imsi": "44010", "ki": testKi, "opc": testOPc, "allowedClientIds": []int64{5}}, "CLIENT_NOT_FOUND", []string{"allowedClientIds"}},
-		{"unknown member", `{"imsi":"44010","ki":"` + testKi + `","opc":"` + testOPc + `","allowedClientIDs":[]}`, "INVALID_MSG_FORMAT", nil},
+		{"unknown client", map[string]any{"imsi": "44010", "ki": testKi, "opc": testOPc, "state": "active", "allowedClientIds": []int64{5}}, "CLIENT_NOT_FOUND", []string{"allowedClientIds"}},
+		{"unknown member", `{"imsi":"44010","ki":"` + testKi + `","opc":"` + testOPc + `","state":"active","allowPlain":true}`, "INVALID_MSG_FORMAT", nil},
 		{"not JSON", `imsi=1`, "INVALID_MSG_FORMAT", nil},
 		{"wrong type", `{"imsi":44010}`, "INVALID_MSG_FORMAT", nil},
 	}
@@ -361,7 +397,7 @@ func TestListSubscribers(t *testing.T) {
 	c := e.addClient("c")
 	imsis := []string{"440100000000001", "440100000000002", "440100000000003", "440200000000001", "440200000000002"}
 	for _, imsi := range imsis {
-		decode[subscriber](t, e.do("POST", "/subscribers", map[string]any{"imsi": imsi, "ki": testKi, "opc": testOPc, "allowedClientIds": []int64{c.ID}}), http.StatusCreated)
+		decode[subscriber](t, e.do("POST", "/subscribers", map[string]any{"imsi": imsi, "ki": testKi, "opc": testOPc, "state": "active", "allowedClientIds": []int64{c.ID}}), http.StatusCreated)
 	}
 	type page struct {
 		Items      []subscriber `json:"items"`
@@ -443,7 +479,7 @@ func TestClientLifecycle(t *testing.T) {
 		len(c.FingerprintSHA256) != 64 || c.NotBefore.IsZero() || !c.NotAfter.After(time.Now()) || c.CertPEM != pem {
 		t.Errorf("created = %+v", c)
 	}
-	if loc := r.header.Get("Location"); loc != "/admin/v1/clients/1" {
+	if loc := r.header.Get("Location"); loc != "/admin/v2/clients/1" {
 		t.Errorf("Location = %q", loc)
 	}
 	wantProblem(t, e.do("POST", "/clients", map[string]any{"name": "again", "certPem": pem}), http.StatusConflict, "CERT_ALREADY_REGISTERED")
@@ -605,7 +641,7 @@ func TestAVServerCertificate(t *testing.T) {
 func TestStatus(t *testing.T) {
 	e := newEnv(t)
 	e.addClient("c")
-	decode[subscriber](t, e.do("POST", "/subscribers", map[string]any{"imsi": "44010", "ki": testKi, "opc": testOPc}), http.StatusCreated)
+	decode[subscriber](t, e.do("POST", "/subscribers", map[string]any{"imsi": "44010", "ki": testKi, "opc": testOPc, "state": "active"}), http.StatusCreated)
 
 	s := decode[struct {
 		Version         string    `json:"version"`
@@ -613,9 +649,8 @@ func TestStatus(t *testing.T) {
 		StartedAt       time.Time `json:"startedAt"`
 		SubscriberCount int       `json:"subscriberCount"`
 		ClientCount     int       `json:"clientCount"`
-		AVPlainEnabled  bool      `json:"avPlainEnabled"`
 	}](t, e.do("GET", "/status", nil), http.StatusOK)
-	if s.Version != "test" || s.BootID != "boot-1" || s.StartedAt.IsZero() || s.SubscriberCount != 1 || s.ClientCount != 1 || !s.AVPlainEnabled {
+	if s.Version != "test" || s.BootID != "boot-1" || s.StartedAt.IsZero() || s.SubscriberCount != 1 || s.ClientCount != 1 {
 		t.Errorf("status = %+v", s)
 	}
 }
@@ -691,7 +726,7 @@ func TestAuditLogPaging(t *testing.T) {
 func TestOperatorHeader(t *testing.T) {
 	e := newEnv(t)
 	send := func(operator string) response {
-		req := httptest.NewRequest("POST", "/admin/v1/clients", strings.NewReader(`{"name":"c","certPem":"`+strings.ReplaceAll(must(clientCertPEM(t, "c"+operator, time.Hour)), "\n", `\n`)+`"}`))
+		req := httptest.NewRequest("POST", "/admin/v2/clients", strings.NewReader(`{"name":"c","certPem":"`+strings.ReplaceAll(must(clientCertPEM(t, "c"+operator, time.Hour)), "\n", `\n`)+`"}`))
 		if operator != "" {
 			req.Header.Set("X-Operator-Id", operator)
 		}
@@ -721,7 +756,7 @@ func TestTraceID(t *testing.T) {
 		if body != "" {
 			rd = strings.NewReader(body)
 		}
-		req := httptest.NewRequest(method, "/admin/v1"+path, rd)
+		req := httptest.NewRequest(method, "/admin/v2"+path, rd)
 		if operator != "" {
 			req.Header.Set("X-Operator-Id", operator)
 		}
@@ -733,7 +768,7 @@ func TestTraceID(t *testing.T) {
 		return response{rec.Code, rec.Header(), rec.Body.Bytes()}
 	}
 	subscriber := func(imsi string) string {
-		return `{"imsi":"` + imsi + `","ki":"` + testKi + `","opc":"` + testOPc + `"}`
+		return `{"imsi":"` + imsi + `","ki":"` + testKi + `","opc":"` + testOPc + `","state":"active"}`
 	}
 	generated := regexp.MustCompile(`^[0-9a-f]{32}$`)
 
@@ -783,12 +818,12 @@ func TestTraceID(t *testing.T) {
 		if l.Level != "INFO" {
 			t.Errorf("level = %s", l.Level)
 		}
-		if l.Attrs["path"] == "/admin/v1/logs" {
+		if l.Attrs["path"] == "/admin/v2/logs" {
 			t.Errorf("GET /logs is logged at info: %v", l.Attrs)
 		}
 		completed[fmt.Sprint(l.Attrs["trace_id"])] = l.Attrs
 	}
-	if a := completed["trace-001"]; a == nil || a["method"] != "POST" || a["path"] != "/admin/v1/subscribers" ||
+	if a := completed["trace-001"]; a == nil || a["method"] != "POST" || a["path"] != "/admin/v2/subscribers" ||
 		fmt.Sprint(a["http_status"]) != "201" || a["mgmt_client"] != "test-bff" || a["operator"] != "alice" {
 		t.Errorf("trace-001 = %v", a)
 	}

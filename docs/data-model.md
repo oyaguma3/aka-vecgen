@@ -2,7 +2,7 @@
 
 - 状態: ドラフト
 - 対象: aka-vecgen が Valkey に持つデータと、その操作手順。
-- 関連: [設計概要（PoC。今の作り）](poc/design-overview.md)、[認証ベクターAPI](openapi/av-api.yaml)、[管理API](openapi/admin-api.yaml)
+- 関連: [設計概要（MVP）](design-overview.md)、[設計概要（PoC）](poc/design-overview.md)、[認証ベクターAPI の契約](https://github.com/oyaguma3/aka-mvpset/blob/main/docs/av-api-contract.md)、[管理API](openapi/admin-api.yaml)
 
 ## 1. 前提
 
@@ -38,7 +38,8 @@
 | `sqn` | 10進整数（0 〜 2^48−1） | 最後に払い出した SQN。API では 16進 12 桁で表す |
 | `amf` | 16進 4 桁 | AMF |
 | `sqn_type` | `inc1` / `inc32` / `inc33` | SQN 増加タイプ |
-| `allow_plain` | `0` / `1` | 平文HTTP での払い出しを許可するか |
+| `state` | `active` / `inactive` / `terminated` | 状態（MVP の設計概要 §7）。払い出すのは `active` だけ。値がなければ払い出さない |
+| `state_changed_at` | 日時 | 状態が最後に変わった日時（登録を含む） |
 | `created_at` | 日時 | 登録日時 |
 | `updated_at` | 日時 | 最終変更日時。SQN の払い出しでは更新しない |
 
@@ -58,8 +59,10 @@
 
 複数キーにまたがる操作は Lua スクリプトでまとめ、途中の状態が見えないようにする。
 
-- 登録: `sub:{imsi}` が既にあれば失敗。なければ Hash、Set、索引を作る。
-- 削除: Hash、Set、索引を消す。
+- 登録: `sub:{imsi}` が既にあれば失敗。なければ Hash、Set、索引を作る。状態は `active` か `inactive`（`terminated` では登録できない）。
+- 削除: `state` が `active` なら断る（`ACTIVE`）。それ以外は Hash、Set、索引を消す。
+- 変更: `state` が `terminated` なら断る。鍵（`ki`・`opc`）は登録の後に変えない。
+- 状態の変更: 移り方の規則を 1 つの Lua で確かめる。`terminated` からは、戻し（`reinstate`。`inactive` にする）だけが許される。同じ状態への変更は書き込まない。
 
 ## 4. SQN の払い出し
 
@@ -87,25 +90,27 @@
 |---|---|
 | `KEYS[1]` | `sub:{imsi}` |
 | `KEYS[2]` | `sub:{imsi}:clients` |
-| `KEYS[3]` | `client:{id}`。平文HTTP の場合は省略 |
-| `ARGV[1]` | クライアントID。平文HTTP の場合は空文字列 |
+| `KEYS[3]` | `client:{id}` |
+| `ARGV[1]` | クライアントID |
 | `ARGV[2]` | 生成数 n。0 なら SQN を進めずに現在の値を返す |
 | `ARGV[3]` | 再同期で置き換える SQN。通常時は空文字列 |
-| `ARGV[4]` | 要求された Network Name（`anId`）。空文字列なら照合しない |
+| `ARGV[4]` | 要求された Network Name（`anId`）。空文字列なら照合しない（EAP-AKA' 以外） |
 | `ARGV[5]` | Network Name の既定値（`WLAN`） |
 
 処理:
 
-1. `sub:{imsi}` がなければ `NOT_FOUND` を返す。
-2. 許可判定をする。満たさなければ `FORBIDDEN` を返す。
-   - クライアントID が空の場合: `allow_plain` が `1` であること。
-   - クライアントID がある場合: `client:{id}` の `enabled` が `1` で、かつ `sub:{imsi}:clients` に含まれること。削除済みのクライアントは `client:{id}` がないので、ここで拒否される。
-3. 使う Network Name を決める。クライアントに `network_name` が設定されていればその値、なければ既定値。`ARGV[4]` が空でなく、この値と一致しなければ `NETWORK_NAME_MISMATCH` を返す。
-4. `ARGV[3]` があれば、S をその値に置き換える。
-5. `sqn_type` と n から払い出し後の値を計算して `sqn` に書き込む。n が 0 で再同期でもなければ書き込まない。
-6. `OK` とともに、S（加算前の値）、`ki`、`opc`、`amf`、`sqn_type`、Network Name を返す。
+判定の順は、認証ベクターAPI の契約 §9.2 のとおり、加入者に依らない検査（1）を先に、加入者に依る検査（2〜5）を後に行う。
 
-拒否した場合（1〜3）は SQN を進めない。
+1. 使う Network Name を決める。クライアントに `network_name` が設定されていればその値、なければ既定値。`ARGV[4]` が空でなく、この値と一致しなければ `NETWORK_NAME_MISMATCH` を返す（加入者の有無によらない）。
+2. `sub:{imsi}` がなければ `NOT_FOUND` を返す。
+3. `client:{id}` の `enabled` が `1` でなければ `CLIENT_DISABLED` を返す。削除済みのクライアントは `client:{id}` がないので、ここで拒否される。
+4. クライアントID が `sub:{imsi}:clients` に含まれなければ `FORBIDDEN` を返す。
+5. `state` が `terminated` なら `TERMINATED`、`active` でなければ `INACTIVE` を返す。
+6. `ARGV[3]` があれば、S をその値に置き換える。
+7. `sqn_type` と n から払い出し後の値を計算して `sqn` に書き込む。n が 0 で再同期でもなければ書き込まない。
+8. `OK` とともに、S（加算前の値）、`ki`、`opc`、`amf`、`sqn_type`、Network Name を返す。
+
+拒否した場合（1〜5）は SQN を進めない。2〜5 の拒否は、認証ベクターAPI ではどれも同じ一般的な拒否（403）になり、理由はログにだけ残る。
 
 各ベクターの SQN は、返された S と `sqn_type` から Go 側で 4.1 の式どおりに計算する。
 

@@ -206,13 +206,16 @@ type clientIDKey struct{}
 func (s *Server) identifyAVClient(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-			avapi.WriteForbidden(w, "client certificate required")
+			s.log.Warn("av request rejected", "listener", "av-mtls", "reason", avapi.ReasonClientUnknown, "remote", r.RemoteAddr)
+			avapi.WriteRejected(w)
 			return
 		}
 		c, err := s.store.ClientByFingerprint(r.Context(), certs.Fingerprint(r.TLS.PeerCertificates[0]))
 		switch {
 		case errors.Is(err, store.ErrNotFound):
-			avapi.WriteForbidden(w, "client certificate is not registered")
+			// ハンドシェイクの後に削除されたクライアント。一般的な拒否にする（契約 §9.2）。
+			s.log.Warn("av request rejected", "listener", "av-mtls", "reason", avapi.ReasonClientUnknown, "remote", r.RemoteAddr)
+			avapi.WriteRejected(w)
 			return
 		case err != nil:
 			s.log.Error("client lookup failed", "error", err)
@@ -301,20 +304,6 @@ func (s *Server) listen(admin http.Handler) (listeners []listener, err error) {
 		return nil, fmt.Errorf("listen av-mtls %s: %w", s.cfg.AVTLSAddr, err)
 	}
 	listeners = append(listeners, listener{"av-mtls", s.httpServer(s.identifyAVClient(mtls.Routes())), ln})
-
-	// AV / 平文HTTP（既定で無効）
-	if s.cfg.AVPlainAddr != "" {
-		plain := &avapi.Handler{
-			Allocator: s.store,
-			Log:       s.log.With("listener", "av-plain"),
-			ClientID:  func(*http.Request) int64 { return 0 },
-		}
-		ln, err := net.Listen("tcp", s.cfg.AVPlainAddr)
-		if err != nil {
-			return listeners, fmt.Errorf("listen av-plain %s: %w", s.cfg.AVPlainAddr, err)
-		}
-		listeners = append(listeners, listener{"av-plain", s.httpServer(plain.Routes()), ln})
-	}
 
 	// 管理API
 	if s.AdminEnabled() {

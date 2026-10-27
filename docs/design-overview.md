@@ -177,8 +177,8 @@
 
 | # | 内容 |
 |---|---|
-| V1 | 未登録・許可なし・`inactive`・`terminated`・AUTS の誤り・無効のクライアントを、固定の本文の 403 にする。理由はログに残す（`not_found`、`client_not_allowed`、`inactive`、`terminated`、`auts_invalid`、`client_disabled`） |
-| V2 | 判定の順: TLS でのクライアントの識別 → 形の検査 → ネットワーク名の照合（クライアントの `network_name` だけで行う）→ 払い出しの Lua（有無・許可・状態）→ 再同期なら AUTS |
+| V1 | 未登録・許可なし・`inactive`・`terminated`・AUTS の誤り・無効のクライアントを、固定の本文の 403 にする。理由はログに残す（`not_found`、`client_not_allowed`、`inactive`、`terminated`、`auts_invalid`、`client_disabled`、`client_unknown`（ハンドシェイクの後に削除されたクライアント）） |
+| V2 | 判定の順: TLS でのクライアントの識別 → 形の検査 → ネットワーク名の照合（クライアントの `network_name` だけで行う）→ 加入者の有無 → クライアントの有効 → 許可 → 状態 → 再同期なら AUTS。ネットワーク名から状態までは払い出しの Lua の中でこの順に行う（§9.2） |
 | V3 | `EAP_AKA_PRIME` で `anId` がなければ 400 `MANDATORY_IE_MISSING` |
 | V4 | クライアントの `network_name` を「許す値」として扱う（空なら `WLAN`） |
 | V5 | `Cache-Control: no-store` を付ける。Valkey に届かないときは 503 `NF_CONGESTION`、他の中の誤りは 500 `SYSTEM_FAILURE`（§17 の B10） |
@@ -191,14 +191,15 @@
 
 もとの実装のデータモデル §4.2 の手順を、次のように変える。
 
-1. `sub:{imsi}` がなければ `NOT_FOUND`。
-2. クライアントが無効なら `CLIENT_DISABLED`、許可クライアントに含まれなければ `FORBIDDEN`。
-3. `state` が `active` でなければ `INACTIVE` / `TERMINATED`。
-4. 再同期の SQN があれば置き換え、n 個分 SQN を進める。
-5. `OK` とともに、加算前の SQN、`cred`、`amf`、`sqn_type` を返す。
+1. クライアントのネットワーク名（なければ `WLAN`）と `anId` を照合し、合わなければ `NETWORK_NAME_MISMATCH`（加入者を調べる前。V2）。
+2. `sub:{imsi}` がなければ `NOT_FOUND`。
+3. クライアントが無効なら `CLIENT_DISABLED`、許可クライアントに含まれなければ `FORBIDDEN`。
+4. `state` が `active` でなければ `INACTIVE` / `TERMINATED`。
+5. 再同期の SQN があれば置き換え、n 個分 SQN を進める。
+6. `OK` とともに、加算前の SQN、`cred`、`amf`、`sqn_type` を返す。
 
-- ネットワーク名の照合は Lua から外し、Go の側で加入者を調べる前に行う（V2）。
-- 1〜3 はどれも SQN を進めず、Go の側で同じ一般的な拒否にする。
+- 1 は、Lua から外して Go の側で行う案だったが、Lua の先頭で行うことにした（2026-10-27、段階 2-1）。判定の順は同じで、クライアントの設定を読むための Valkey への往復が増えない。
+- 1〜4 はどれも SQN を進めない。2〜4 は Go の側で同じ一般的な拒否にする。
 
 ### 9.3 AV クライアントとサーバー証明書
 
@@ -216,7 +217,7 @@
 - mTLS 必須。管理クライアントは、ファイル（`VECGEN_ADMIN_CLIENTS_FILE`。1 行に `識別名=フィンガープリント`）で設定する。`SIGHUP` で読み直す（再起動しない。概要 §12.3）。同じ識別名に 2 つのフィンガープリントを並べて書けるようにし、証明書の入れ替えの間は新旧の両方を受ける（§17 の B7）。読み直しは、ファイルが読めない・形が違うときは前の設定のまま続け、ログに出す。
 - 管理API のサーバー証明書は、もとの実装と同じく自己署名（`aka-vecgen admin-cert reset` で作り直す）。
 - `X-Operator-Id`（操作者）と `X-Trace-ID`（受け取るか採番し、応答で返す）は、もとの実装の管理API 0.2.0 と同じ。
-- エラーは ProblemDetails（`application/problem+json`）で、`cause` に理由の符号を入れる。主な `cause`: `VALIDATION_ERROR`、`SUBSCRIBER_NOT_FOUND`、`SUBSCRIBER_EXISTS`、`SUBSCRIBER_ACTIVE`、`SUBSCRIBER_TERMINATED`、`STATE_TRANSITION_NOT_ALLOWED`、`UNKNOWN_CLIENT`、`KEY_EXPORT_DISABLED`、`SYSTEM_FAILURE`。
+- エラーは ProblemDetails（`application/problem+json`）で、`cause` に理由の符号を入れる。`cause` は、もとの実装の管理API 0.2.0 にある誤りはその名前のまま（入力の誤りは `INVALID_MSG_FORMAT`・`MANDATORY_IE_MISSING`・`MANDATORY_IE_INCORRECT`・`OPTIONAL_IE_INCORRECT`、`USER_NOT_FOUND`、`SUBSCRIBER_ALREADY_EXISTS`、`CLIENT_NOT_FOUND`、`SYSTEM_FAILURE` など）とし、MVP で足す誤りだけ新しい名前にする（`SUBSCRIBER_ACTIVE`、`SUBSCRIBER_TERMINATED`、`STATE_TRANSITION_NOT_ALLOWED`。段階 2-3 で `KEY_EXPORT_DISABLED`）。名前を変える理由がなく、変えると口の変更が増えるだけなので（2026-10-27、段階 2-1）。
 - `Idempotency-Key` は aka-vecgen では扱わない。再送の判定は aka-provisioner が行う（provisioner の設計概要 §9.2）。登録は「既にあれば 409 `SUBSCRIBER_EXISTS`」、削除は「なければ 404」なので、一括投入の「既にある」「ない IMSI は飛ばす」（概要 §10.3）はこの応答で数えられる。
 
 ### 10.2 口
@@ -321,7 +322,7 @@
 | 段階 | 内容 | 終わりの確かめ |
 |---|---|---|
 | 1 | リポジトリ `aka-vecgen` を作り、aka-only-server の履歴ごと移す。改名だけ（module パス、コマンド、環境変数の接頭辞、Docker のネットワーク名、イメージ名、文書） | 今の CI が通る |
-| 2-1 | 状態と払い出しの Lua の変更、認証ベクターAPI を契約に合わせる（V1〜V6）、平文HTTP をなくす、管理API 2.0.0 の加入者の口（状態の変更と戻しを含む） | 単体・結合、適合試験 |
+| 2-1 | 状態と払い出しの Lua の変更、認証ベクターAPI を契約に合わせる（V1〜V6）、平文HTTP をなくす、管理API 2.0.0 の加入者の口（状態の変更と戻しを含む） | 単体・結合、適合試験。**済み（2026-10-27）**: 適合試験 11 項目すべて PASS |
 | 2-2 | 鍵の暗号化、KEK（起動の確認、`gen-kek`、`rotate-kek`） | 単体・結合、検証機での性能の軽い計測 |
 | 2-3 | 管理API 2.0.0 の残り（一括取得、鍵の口の既定の無効、AV クライアントと証明書の書き込みの口をコマンドへ、`/logs` をなくす）、ピンのファイルと `SIGHUP`、監査ログの書き出し | 結合 |
 | 2-4 | 運用ガイド（導入、KEK とバックアップ、SQN の方式の指針、鍵を誤ったときの登録し直し）、README | 手元の compose、simwifi で aka-radius から認証 |

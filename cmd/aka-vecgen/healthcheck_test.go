@@ -14,9 +14,8 @@ func TestListenerAddrs(t *testing.T) {
 		t.Errorf("AV only: %v", got)
 	}
 	all := base
-	all.AVPlainAddr = ":8080"
 	all.AdminClients = map[string]string{"00": "bff"}
-	if got := listenerAddrs(all); !slices.Equal(got, []string{":8443", ":8080", ":9443"}) {
+	if got := listenerAddrs(all); !slices.Equal(got, []string{":8443", ":9443"}) {
 		t.Errorf("all listeners: %v", got)
 	}
 }

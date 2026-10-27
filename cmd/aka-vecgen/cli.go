@@ -34,13 +34,20 @@ func subscriberCommand(ctx context.Context, args []string) error {
 		sqn := fs.String("sqn", "000000000000", "SQN の初期値（16進 12 桁）")
 		amf := fs.String("amf", "8000", "AMF（16進 4 桁）")
 		sqnType := fs.String("sqn-type", string(aka.SQNInc32), "SQN 増加タイプ（inc1 / inc32 / inc33）")
-		allowPlain := fs.Bool("allow-plain", false, "平文HTTP での払い出しを許可する")
+		state := fs.String("state", string(store.StateActive), "状態（active / inactive / terminated。terminated は inactive で登録してから変える）")
 		clients := fs.String("clients", "", "許可クライアントID（カンマ区切り）")
 		fs.Parse(args[1:])
 
-		sub := store.Subscriber{IMSI: *imsi, SQNType: aka.SQNType(*sqnType), AllowPlain: *allowPlain}
+		sub := store.Subscriber{IMSI: *imsi, SQNType: aka.SQNType(*sqnType), State: store.State(*state)}
 		if !imsiPattern.MatchString(sub.IMSI) {
 			return errors.New("-imsi must be 5 to 15 digits")
+		}
+		if !sub.State.Valid() {
+			return errors.New("-state must be active, inactive or terminated")
+		}
+		terminate := sub.State == store.StateTerminated
+		if terminate {
+			sub.State = store.StateInactive
 		}
 		var err error
 		if sub.Ki, err = hexBytes("-ki", *ki, 16); err != nil {
@@ -83,7 +90,13 @@ func subscriberCommand(ctx context.Context, args []string) error {
 		if err := st.CreateSubscriber(ctx, sub); err != nil {
 			return err
 		}
-		fmt.Printf("subscriber %s added\n", sub.IMSI)
+		if terminate {
+			if _, _, err := st.SetState(ctx, sub.IMSI, store.StateTerminated); err != nil {
+				return fmt.Errorf("subscriber %s was added as inactive, but setting it terminated failed: %w", sub.IMSI, err)
+			}
+			sub.State = store.StateTerminated
+		}
+		fmt.Printf("subscriber %s added (state=%s)\n", sub.IMSI, sub.State)
 		return nil
 
 	case "show":
@@ -99,10 +112,10 @@ func subscriberCommand(ctx context.Context, args []string) error {
 		}
 		// Ki と OPc は表示しない。
 		fmt.Printf("imsi:        %s\n", sub.IMSI)
+		fmt.Printf("state:       %s\n", sub.State)
 		fmt.Printf("sqn:         %012x\n", sub.SQN)
 		fmt.Printf("amf:         %04x\n", sub.AMF)
 		fmt.Printf("sqn-type:    %s\n", sub.SQNType)
-		fmt.Printf("allow-plain: %t\n", sub.AllowPlain)
 		fmt.Printf("clients:     %v\n", sub.AllowedClientIDs)
 		fmt.Printf("created-at:  %s\n", sub.CreatedAt.Format(time.RFC3339))
 		return nil

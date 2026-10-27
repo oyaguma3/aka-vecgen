@@ -175,7 +175,7 @@ func (h *Handler) createClient(w http.ResponseWriter, r *http.Request) {
 	h.audit(r, "client.create", id, map[string]any{
 		"name": c.Name, "fingerprintSha256": c.Fingerprint, "enabled": c.Enabled, "networkName": c.NetworkName,
 	})
-	w.Header().Set("Location", "/admin/v1/clients/"+id)
+	w.Header().Set("Location", "/admin/v2/clients/"+id)
 	writeJSON(w, http.StatusCreated, toClientJSON(c))
 }
 

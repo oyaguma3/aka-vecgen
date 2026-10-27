@@ -5,7 +5,7 @@
 
 > このリポジトリは、VPS に分けて置いて顧客を収容する **MVP セット**（[aka-mvpset](https://github.com/oyaguma3/aka-mvpset)）の、認証ベクターを作るノードです。PoC セット（[eapaka-pocset](https://github.com/oyaguma3/eapaka-pocset) の `pocset-v1.0.1`）の [aka-only-server](https://github.com/oyaguma3/aka-only-server) の履歴を引き継いで作りました（もとのコミット `c2a093d`）。
 >
-> いまは名前を変えただけで、作りは aka-only-server と同じです（コマンドは `aka-vecgen`、環境変数の接頭辞は `VECGEN_`）。MVP のための改修（状態、鍵の暗号化、認証ベクターAPI の契約への合わせ込み、管理API 2.0.0 など）は、[設計概要](docs/design-overview.md)のとおりに MVP セットの段階 2 で行います。今の作りの説明は [PoC の設計概要](docs/poc/design-overview.md)にあります。
+> MVP セットの段階 2-1 まで済んでいます（加入者の状態、認証ベクターAPI の[契約](https://github.com/oyaguma3/aka-mvpset/blob/main/docs/av-api-contract.md)への合わせ込み、平文HTTP の廃止、管理API 2.0.0（`/admin/v2`）の加入者の口）。鍵の暗号化（2-2）と管理API の残り（2-3）はこれからです。設計は[設計概要](docs/design-overview.md)、段階 1 までの作りは [PoC の設計概要](docs/poc/design-overview.md)にあります。コマンドは `aka-vecgen`、環境変数の接頭辞は `VECGEN_` です。
 
 指定した IMSI に対して、Milenage による AKA 認証ベクターを払い出す API サーバーです。EAP-AKA / EAP-AKA' の RADIUS サーバーなどから使うことを想定しています。
 
@@ -21,7 +21,7 @@
 
 | フェーズ | 内容 | 状態 |
 |---|---|---|
-| 1 | AKA コア、Valkey、認証ベクターAPI（mTLS / 平文HTTP） | 実装済み |
+| 1 | AKA コア、Valkey、認証ベクターAPI（mTLS。平文HTTP は MVP の段階 2-1 でなくした） | 実装済み |
 | 2 | 管理API | 実装済み |
 | 3 | BFF / Web GUI（web-gui-for-aka-only-server） | 実装済み |
 
@@ -83,9 +83,9 @@ curl --cacert server.pem --cert radius.pem -X POST https://localhost:8443/nudm-u
 |---|---|---|
 | `eap-aka` | `EAP_AKA` | CK、IK |
 | `umts-aka` | `UMTS_AKA` | CK、IK |
-| `eap-aka-prime` | `EAP_AKA_PRIME` | CK'、IK'（Network Name は `WLAN`） |
+| `eap-aka-prime` | `EAP_AKA_PRIME` | CK'、IK'（ボディの `anId` に、クライアントに許したネットワーク名を入れる。既定は `WLAN`） |
 
-`numOfRequestedVectors` は 1〜5 です。再同期は `resynchronizationInfo`（`rand` と `auts`）を付けて要求します。詳細は [docs/openapi/av-api.yaml](docs/openapi/av-api.yaml) を参照してください。
+`numOfRequestedVectors` は 1〜5 です。再同期は `resynchronizationInfo`（`rand` と `auts`）を付けて要求します。EAP-AKA' では `anId`（ネットワーク名）が必須です。仕様の正本は aka-mvpset の[認証ベクターAPI の契約](https://github.com/oyaguma3/aka-mvpset/blob/main/docs/av-api-contract.md)（[OpenAPI](https://github.com/oyaguma3/aka-mvpset/blob/main/docs/openapi/av-api.yaml)）で、加入者が登録されていない・許可されていない・inactive・terminated・AUTS の誤りは、どれも同じ 403 の本文で返します（理由はログの `reason` に残ります）。
 
 ## 管理API
 
@@ -114,7 +114,7 @@ docker compose exec -T aka-vecgen /aka-vecgen admin-cert > admin.pem
 ```
 
 ```bash
-curl --cacert admin.pem --cert bff.pem https://localhost:9443/admin/v1/status
+curl --cacert admin.pem --cert bff.pem https://localhost:9443/admin/v2/status
 ```
 
 操作の一覧は [docs/openapi/admin-api.yaml](docs/openapi/admin-api.yaml)、設定と運用の詳細は [docs/operation-guide.md](docs/operation-guide.md) を参照してください。
@@ -143,8 +143,6 @@ curl --cacert admin.pem --cert bff.pem https://localhost:9443/admin/v1/status
 | `VALKEY_PASSWORD` | （必須） | Valkey のパスワード |
 | `VECGEN_AV_TLS_PUBLISH` | `0.0.0.0:8443` | mTLS リスナーを公開するホスト側のアドレスとポート |
 | `VECGEN_AV_TLS_HOSTS` | `localhost,127.0.0.1,aka-vecgen` | AV 用の自己署名サーバー証明書の SAN。生成済みの証明書には反映されない |
-| `VECGEN_AV_PLAIN_ADDR` | （空） | 平文HTTP リスナー。空なら無効、有効にする場合は `:8080` |
-| `VECGEN_AV_PLAIN_PUBLISH` | `127.0.0.1:8080` | 平文HTTP リスナーを公開するホスト側のアドレスとポート |
 | `VECGEN_ADMIN_CLIENTS` | （空） | 管理クライアント。`識別名=フィンガープリント` のカンマ区切り。空なら管理API を起動しない |
 | `VECGEN_ADMIN_PUBLISH` | `127.0.0.1:9443` | 管理API を公開するホスト側のアドレスとポート |
 | `VECGEN_ADMIN_TLS_HOSTS` | `localhost,127.0.0.1,aka-vecgen` | 管理API 用の自己署名サーバー証明書の SAN。生成済みの証明書には反映されない |
@@ -154,9 +152,7 @@ curl --cacert admin.pem --cert bff.pem https://localhost:9443/admin/v1/status
 | `VECGEN_AUDIT_MAX` | `10000` | 監査ログの保持件数の上限 |
 | `VECGEN_VERSION` | `dev` | 起動ログと管理API の `/status` に出すバージョン（ビルドのときに埋め込む） |
 
-平文HTTP リスナーは、同一ホスト上のクライアント向けです。CK / IK が平文で流れるので、ループバック以外には公開しないでください。平文HTTP での払い出しは、平文HTTP を許可した加入者に限られます。
-
-Docker が公開したポートは ufw の規則を通りません。公開範囲は `VECGEN_AV_TLS_PUBLISH`、`VECGEN_AV_PLAIN_PUBLISH`、`VECGEN_ADMIN_PUBLISH` のアドレスで制御してください。
+Docker が公開したポートは ufw の規則を通りません。公開範囲は `VECGEN_AV_TLS_PUBLISH`、`VECGEN_ADMIN_PUBLISH` のアドレスで制御してください。
 
 ## 開発
 
@@ -192,7 +188,7 @@ GitHub Actions（`.github/workflows/ci.yml`）で、push と pull request のた
 
 - [設計概要（MVP）](docs/design-overview.md)
 - [PoC の設計概要（今の作り）](docs/poc/design-overview.md)
-- [認証ベクターAPI](docs/openapi/av-api.yaml)
+- [認証ベクターAPI の契約](https://github.com/oyaguma3/aka-mvpset/blob/main/docs/av-api-contract.md)（aka-mvpset。OpenAPI も同じリポジトリ）
 - [管理API](docs/openapi/admin-api.yaml)
 - [データモデル](docs/data-model.md)
 - [運用ガイド](docs/operation-guide.md)

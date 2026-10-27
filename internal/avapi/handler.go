@@ -1,5 +1,5 @@
 // Package avapi は認証ベクターAPI（TS 29.503 GenerateAv ベース）を提供する。
-// API 仕様は docs/openapi/av-api.yaml を参照。
+// API の正本は aka-mvpset の認証ベクターAPI の契約（docs/av-api-contract.md、docs/openapi/av-api.yaml）。
 package avapi
 
 import (
@@ -36,7 +36,7 @@ type Allocator interface {
 type Handler struct {
 	Allocator Allocator
 	Log       *slog.Logger
-	// ClientID はリクエストからクライアントID を取り出す。平文HTTP リスナーでは 0 を返す。
+	// ClientID はリクエストからクライアントID（mTLS で識別したもの）を取り出す。
 	ClientID func(*http.Request) int64
 }
 
@@ -103,14 +103,16 @@ type parsedRequest struct {
 	resync   bool
 	rand     []byte // resync が true のとき有効
 	auts     []byte // resync が true のとき有効
-	anID     string // EAP-AKA' で指定された場合のみ
+	anID     string // EAP-AKA' のときだけ（必須）
 }
 
 func (h *Handler) generateAV(w http.ResponseWriter, r *http.Request) {
-	// 呼び出し元（本PoC の vector-gateway）が X-Trace-ID を送っていればログに残し、1 回の認証を
-	// 呼び出し元のログとつなげられるようにする。なければ採番する。どちらも応答のヘッダーで返す。
+	// 呼び出し元（aka-radius）が X-Trace-ID を送っていればログに残し、1 回の認証を
+	// 呼び出し元のログとつなげられるようにする。なければ採番する。どちらも応答のヘッダーで返す（契約 §11.2）。
 	traceID := traceid.Resolve(r.Header.Get(traceid.Header))
 	w.Header().Set(traceid.Header, traceID)
+	// ベクターを途中で保存させない（契約 §6.3）。
+	w.Header().Set("Cache-Control", "no-store")
 	clientID := h.ClientID(r)
 	log := h.Log.With("trace_id", traceID, "client_id", clientID, "remote", r.RemoteAddr)
 
@@ -124,11 +126,15 @@ func (h *Handler) generateAV(w http.ResponseWriter, r *http.Request) {
 
 	vectors, p := h.generate(r.Context(), clientID, req)
 	if p != nil {
-		if p.status >= http.StatusInternalServerError {
+		switch {
+		case p.status >= http.StatusInternalServerError:
 			log.Error("av request failed", "cause", p.cause, "detail", p.detail)
 			// 内部エラーの詳細はクライアントに返さない。
 			p.detail = ""
-		} else {
+		case p.reason != "":
+			// 一般的な拒否。理由はログにだけ残す（契約 §9.2）。
+			log.Warn("av request rejected", "cause", p.cause, "reason", p.reason)
+		default:
 			log.Warn("av request rejected", "cause", p.cause, "detail", p.detail)
 		}
 		p.write(w)
@@ -189,9 +195,12 @@ func parseRequest(w http.ResponseWriter, r *http.Request) (parsedRequest, *probl
 		req.resync = true
 	}
 
-	// anId は EAP-AKA' 以外では無視する。
-	if at.prime && body.AnID != nil {
-		if *body.AnID == "" {
+	// anId は EAP-AKA' で必須で、それ以外では無視する（契約 §6.4）。
+	if at.prime {
+		switch {
+		case body.AnID == nil:
+			return req, badRequest(causeMandatoryIEMissing, "anId is required for EAP_AKA_PRIME")
+		case *body.AnID == "":
 			return req, badRequest(causeOptionalIEIncorrect, "anId must not be empty")
 		}
 		req.anID = *body.AnID
@@ -218,7 +227,7 @@ func (h *Handler) generate(ctx context.Context, clientID int64, req parsedReques
 		}
 		sqnMS, err := aka.VerifyAUTS(cur.Credentials, req.rand, req.auts)
 		if errors.Is(err, aka.ErrAUTSInvalid) {
-			return nil, &problem{status: http.StatusForbidden, cause: causeAuthRejected, detail: "AUTS verification failed"}
+			return nil, rejected(ReasonAUTSInvalid)
 		}
 		if err != nil {
 			return nil, internalError(err)
@@ -258,18 +267,21 @@ func (h *Handler) generate(ctx context.Context, clientID int64, req parsedReques
 	return vectors, nil
 }
 
+// allocateProblem は払い出しの誤りを応答にする。加入者に依る拒否は、どれも同じ一般的な拒否にする（契約 §9.2）。
 func allocateProblem(err error) *problem {
 	switch {
-	case errors.Is(err, store.ErrNotFound):
-		return &problem{status: http.StatusNotFound, cause: causeUserNotFound, detail: "subscriber not found"}
-	case errors.Is(err, store.ErrForbidden):
-		return &problem{status: http.StatusForbidden, cause: causeAuthRejected, detail: "client is not allowed for this subscriber"}
 	case errors.Is(err, store.ErrNetworkNameMismatch):
-		return badRequest(causeOptionalIEIncorrect, "anId does not match the configured network name")
+		return badRequest(causeOptionalIEIncorrect, "anId does not match the network name allowed for this client")
+	case errors.Is(err, store.ErrNotFound):
+		return rejected(ReasonNotFound)
+	case errors.Is(err, store.ErrForbidden):
+		return rejected(ReasonClientNotAllowed)
+	case errors.Is(err, store.ErrClientDisabled):
+		return rejected(ReasonClientDisabled)
+	case errors.Is(err, store.ErrInactive):
+		return rejected(ReasonInactive)
+	case errors.Is(err, store.ErrTerminated):
+		return rejected(ReasonTerminated)
 	}
 	return internalError(err)
-}
-
-func internalError(err error) *problem {
-	return &problem{status: http.StatusInternalServerError, cause: causeSystemFailure, detail: err.Error()}
 }

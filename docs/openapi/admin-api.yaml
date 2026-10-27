@@ -1,10 +1,19 @@
 openapi: 3.0.3
 info:
   title: aka-vecgen 管理API
-  version: 0.2.0
+  version: 2.0.0-draft
   description: |
     加入者、AVクライアント、AV用サーバー証明書、ログを操作する API。
-    web-gui-for-aka-only-server などの管理 GUI 実装は、この API だけを使う。
+    MVP セットでは、管理クライアントは aka-provisioner だけ（設計概要 §1）。
+
+    2.0.0-draft（MVP セットの段階 2-1）:
+    - パスを `/admin/v2` にした。0.2.0 との互換は持たない。
+    - 加入者に状態（`active` / `inactive` / `terminated`）を足した。登録では状態が必須。
+      状態の変更は `PUT /subscribers/{imsi}/state`、terminated からの戻しは `POST /subscribers/{imsi}/reinstate`。
+      `active` は物理削除できず、`terminated` は変更できない（設計概要 §7）。
+    - 平文HTTP をなくしたので、加入者の `allowPlain` と状態の `avPlainEnabled` を外した。
+    - 登録の後に鍵（Ki・OPc）を変える口をなくした（変更の本文に `ki`・`opc` があれば 400）。
+    - 一括取得、鍵の口の既定の無効、AVクライアントとサーバー証明書の書き込みの口の廃止、`/logs` の廃止は、段階 2-3 で行う。
 
     認証:
     - 認証ベクターAPI とは別のポート、別のサーバー証明書で提供する。
@@ -29,7 +38,7 @@ info:
     - エラーは ProblemDetails（`application/problem+json`）で返す。
 
 servers:
-  - url: https://{host}:{port}/admin/v1
+  - url: https://{host}:{port}/admin/v2
     variables:
       host:
         default: localhost
@@ -122,7 +131,7 @@ paths:
               sqn: '000000000000'
               amf: '8000'
               sqnType: inc32
-              allowPlain: false
+              state: active
               allowedClientIds: [1, 2]
       responses:
         '201':
@@ -175,6 +184,8 @@ paths:
       description: |
         指定した項目だけを変更する（JSON Merge Patch）。
         `allowedClientIds` を指定した場合は、集合全体を置き換える。
+        鍵（`ki`・`opc`）と状態（`state`）は変えられない（指定すると 400 の `OPTIONAL_IE_INCORRECT`）。
+        `terminated` の加入者は変更できない（409）。
       requestBody:
         required: true
         content:
@@ -182,7 +193,7 @@ paths:
             schema:
               $ref: '#/components/schemas/SubscriberUpdate'
             example:
-              allowPlain: true
+              amf: '8000'
               allowedClientIds: [1, 3]
       responses:
         '200':
@@ -195,18 +206,114 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/SubscriberNotFound'
+        '409':
+          description: 加入者が `terminated` で変更できない。`cause` は `SUBSCRIBER_TERMINATED`。
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
         '500':
           $ref: '#/components/responses/InternalError'
     delete:
       tags: [subscribers]
-      summary: 加入者を削除する
+      summary: 加入者を物理削除する
       operationId: deleteSubscriber
-      description: 削除時点の SQN、AMF、SQN 増加タイプを監査ログに記録する。
+      description: |
+        `active` の加入者は削除できない（先に `inactive` か `terminated` にする）。
+        削除時点の状態、SQN、AMF、SQN 増加タイプを監査ログに記録する。
       responses:
         '204':
           description: 削除した
         '404':
           $ref: '#/components/responses/SubscriberNotFound'
+        '409':
+          description: 加入者が `active` で削除できない。`cause` は `SUBSCRIBER_ACTIVE`。
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /subscribers/{imsi}/state:
+    parameters:
+      - $ref: '#/components/parameters/Imsi'
+      - $ref: '#/components/parameters/OperatorId'
+      - $ref: '#/components/parameters/TraceId'
+    put:
+      tags: [subscribers]
+      summary: 加入者の状態を変える
+      operationId: setSubscriberState
+      description: |
+        `active` ⇔ `inactive`、`active` / `inactive` → `terminated` に変える。
+        `terminated` からは変えられない（`POST /subscribers/{imsi}/reinstate` を使う）。
+        同じ状態への変更は何もせず 200 を返し、監査ログ（`subscriber.state`、`unchanged`）には残す。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StateChange'
+            example:
+              state: inactive
+              reason: 料金の未払い
+      responses:
+        '200':
+          description: 変更後の加入者
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subscriber'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/SubscriberNotFound'
+        '409':
+          description: 状態の移り方の規則で許されない（`terminated` からの変更）。`cause` は `STATE_TRANSITION_NOT_ALLOWED`。
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /subscribers/{imsi}/reinstate:
+    parameters:
+      - $ref: '#/components/parameters/Imsi'
+      - $ref: '#/components/parameters/OperatorId'
+      - $ref: '#/components/parameters/TraceId'
+    post:
+      tags: [subscribers]
+      summary: terminated の加入者を inactive に戻す
+      operationId: reinstateSubscriber
+      description: |
+        理由は必須で、監査ログ（`subscriber.reinstate`）に残す。
+        システム管理者だけに許すことは呼び出し側（aka-ossbss）が守る。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Reinstate'
+            example:
+              reason: 誤って解約した
+      responses:
+        '200':
+          description: 戻した後の加入者
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subscriber'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/SubscriberNotFound'
+        '409':
+          description: 加入者が `terminated` でない。`cause` は `STATE_TRANSITION_NOT_ALLOWED`。
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -615,29 +722,41 @@ components:
         - inc32
         - inc33
 
+    State:
+      type: string
+      description: 加入者の状態。払い出すのは `active` だけ（設計概要 §7）。
+      enum:
+        - active
+        - inactive
+        - terminated
+
     Subscriber:
       type: object
       required:
         - imsi
+        - state
+        - stateChangedAt
         - sqn
         - amf
         - sqnType
-        - allowPlain
         - allowedClientIds
         - createdAt
         - updatedAt
       properties:
         imsi:
           $ref: '#/components/schemas/Imsi'
+        state:
+          $ref: '#/components/schemas/State'
+        stateChangedAt:
+          type: string
+          format: date-time
+          description: 状態が最後に変わった日時（登録を含む）。
         sqn:
           $ref: '#/components/schemas/Sqn'
         amf:
           $ref: '#/components/schemas/Amf'
         sqnType:
           $ref: '#/components/schemas/SqnType'
-        allowPlain:
-          type: boolean
-          description: 平文HTTP での払い出しを許可するか。
         allowedClientIds:
           type: array
           description: 許可クライアントID。昇順。削除済みクライアントの ID は含めない。
@@ -657,6 +776,7 @@ components:
         - imsi
         - ki
         - opc
+        - state
       properties:
         imsi:
           $ref: '#/components/schemas/Imsi'
@@ -664,6 +784,12 @@ components:
           $ref: '#/components/schemas/Hex128'
         opc:
           $ref: '#/components/schemas/Hex128'
+        state:
+          type: string
+          description: 登録のときの状態。`terminated` では登録できない。
+          enum:
+            - active
+            - inactive
         sqn:
           allOf:
             - $ref: '#/components/schemas/Sqn'
@@ -676,9 +802,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/SqnType'
           default: inc32
-        allowPlain:
-          type: boolean
-          default: false
         allowedClientIds:
           type: array
           default: []
@@ -687,25 +810,42 @@ components:
 
     SubscriberUpdate:
       type: object
-      description: 変更する項目だけを指定する。`null` は指定できない。
+      description: 変更する項目だけを指定する。`null` は指定できない。鍵と状態は変えられない。
       minProperties: 1
       properties:
-        ki:
-          $ref: '#/components/schemas/Hex128'
-        opc:
-          $ref: '#/components/schemas/Hex128'
         sqn:
           $ref: '#/components/schemas/Sqn'
         amf:
           $ref: '#/components/schemas/Amf'
         sqnType:
           $ref: '#/components/schemas/SqnType'
-        allowPlain:
-          type: boolean
         allowedClientIds:
           type: array
           items:
             $ref: '#/components/schemas/ClientId'
+
+    StateChange:
+      type: object
+      required:
+        - state
+      properties:
+        state:
+          $ref: '#/components/schemas/State'
+        reason:
+          type: string
+          maxLength: 500
+          description: 任意の理由（監査ログに残す）。
+
+    Reinstate:
+      type: object
+      required:
+        - reason
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: 戻す理由（必須。空白だけは不可。監査ログに残す）。
 
     SubscriberKeys:
       type: object
@@ -899,7 +1039,6 @@ components:
         - startedAt
         - subscriberCount
         - clientCount
-        - avPlainEnabled
         - avServerCertificateNotAfter
       properties:
         version:
@@ -915,9 +1054,6 @@ components:
           type: integer
         clientCount:
           type: integer
-        avPlainEnabled:
-          type: boolean
-          description: 認証ベクターAPI の平文HTTP リスナーが有効か。
         avServerCertificateNotAfter:
           type: string
           format: date-time
@@ -977,6 +1113,8 @@ components:
         - subscriber.create
         - subscriber.update
         - subscriber.delete
+        - subscriber.state
+        - subscriber.reinstate
         - subscriber.keys.read
         - client.create
         - client.update
@@ -1068,6 +1206,9 @@ components:
             - OPTIONAL_IE_INCORRECT
             - USER_NOT_FOUND
             - SUBSCRIBER_ALREADY_EXISTS
+            - SUBSCRIBER_ACTIVE
+            - SUBSCRIBER_TERMINATED
+            - STATE_TRANSITION_NOT_ALLOWED
             - CLIENT_NOT_FOUND
             - CERT_ALREADY_REGISTERED
             - INVALID_CERTIFICATE

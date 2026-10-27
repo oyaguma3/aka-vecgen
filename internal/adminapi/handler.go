@@ -27,6 +27,8 @@ type Store interface {
 	GetSubscriber(ctx context.Context, imsi string) (store.Subscriber, error)
 	UpdateSubscriber(ctx context.Context, imsi string, p store.SubscriberPatch) error
 	DeleteSubscriber(ctx context.Context, imsi string) error
+	SetState(ctx context.Context, imsi string, to store.State) (from store.State, unchanged bool, err error)
+	Reinstate(ctx context.Context, imsi string) (store.State, error)
 	ListSubscribers(ctx context.Context, prefix, cursor string, limit int) (store.SubscriberPage, error)
 	CountSubscribers(ctx context.Context) (int64, error)
 
@@ -63,10 +65,9 @@ type Handler struct {
 	// MgmtClient はリクエストから管理クライアントの識別名を取り出す。
 	MgmtClient func(*http.Request) string
 
-	Version        string
-	BootID         string
-	StartedAt      time.Time
-	AVPlainEnabled bool
+	Version   string
+	BootID    string
+	StartedAt time.Time
 	// AuditMaxLen は監査ログの保持件数の上限。
 	AuditMaxLen int64
 }
@@ -74,28 +75,30 @@ type Handler struct {
 // Routes は管理API のルーティングを返す。
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /admin/v1/status", h.getStatus)
+	mux.HandleFunc("GET /admin/v2/status", h.getStatus)
 
-	mux.HandleFunc("GET /admin/v1/subscribers", h.listSubscribers)
-	mux.HandleFunc("POST /admin/v1/subscribers", h.createSubscriber)
-	mux.HandleFunc("GET /admin/v1/subscribers/{imsi}", h.getSubscriber)
-	mux.HandleFunc("PATCH /admin/v1/subscribers/{imsi}", h.updateSubscriber)
-	mux.HandleFunc("DELETE /admin/v1/subscribers/{imsi}", h.deleteSubscriber)
-	mux.HandleFunc("GET /admin/v1/subscribers/{imsi}/keys", h.getSubscriberKeys)
+	mux.HandleFunc("GET /admin/v2/subscribers", h.listSubscribers)
+	mux.HandleFunc("POST /admin/v2/subscribers", h.createSubscriber)
+	mux.HandleFunc("GET /admin/v2/subscribers/{imsi}", h.getSubscriber)
+	mux.HandleFunc("PATCH /admin/v2/subscribers/{imsi}", h.updateSubscriber)
+	mux.HandleFunc("DELETE /admin/v2/subscribers/{imsi}", h.deleteSubscriber)
+	mux.HandleFunc("PUT /admin/v2/subscribers/{imsi}/state", h.setSubscriberState)
+	mux.HandleFunc("POST /admin/v2/subscribers/{imsi}/reinstate", h.reinstateSubscriber)
+	mux.HandleFunc("GET /admin/v2/subscribers/{imsi}/keys", h.getSubscriberKeys)
 
-	mux.HandleFunc("GET /admin/v1/clients", h.listClients)
-	mux.HandleFunc("POST /admin/v1/clients", h.createClient)
-	mux.HandleFunc("GET /admin/v1/clients/{clientId}", h.getClient)
-	mux.HandleFunc("PATCH /admin/v1/clients/{clientId}", h.updateClient)
-	mux.HandleFunc("DELETE /admin/v1/clients/{clientId}", h.deleteClient)
-	mux.HandleFunc("PUT /admin/v1/clients/{clientId}/certificate", h.replaceClientCertificate)
+	mux.HandleFunc("GET /admin/v2/clients", h.listClients)
+	mux.HandleFunc("POST /admin/v2/clients", h.createClient)
+	mux.HandleFunc("GET /admin/v2/clients/{clientId}", h.getClient)
+	mux.HandleFunc("PATCH /admin/v2/clients/{clientId}", h.updateClient)
+	mux.HandleFunc("DELETE /admin/v2/clients/{clientId}", h.deleteClient)
+	mux.HandleFunc("PUT /admin/v2/clients/{clientId}/certificate", h.replaceClientCertificate)
 
-	mux.HandleFunc("GET /admin/v1/av-server-certificate", h.getAVServerCertificate)
-	mux.HandleFunc("PUT /admin/v1/av-server-certificate", h.replaceAVServerCertificate)
-	mux.HandleFunc("DELETE /admin/v1/av-server-certificate", h.resetAVServerCertificate)
+	mux.HandleFunc("GET /admin/v2/av-server-certificate", h.getAVServerCertificate)
+	mux.HandleFunc("PUT /admin/v2/av-server-certificate", h.replaceAVServerCertificate)
+	mux.HandleFunc("DELETE /admin/v2/av-server-certificate", h.resetAVServerCertificate)
 
-	mux.HandleFunc("GET /admin/v1/logs", h.listLogs)
-	mux.HandleFunc("GET /admin/v1/audit-logs", h.listAuditLogs)
+	mux.HandleFunc("GET /admin/v2/logs", h.listLogs)
+	mux.HandleFunc("GET /admin/v2/audit-logs", h.listAuditLogs)
 	return h.observe(checkOperator(mux))
 }
 
@@ -121,7 +124,7 @@ func (h *Handler) observe(next http.Handler) http.Handler {
 		next.ServeHTTP(rec, r)
 
 		level := slog.LevelInfo
-		if r.Method == http.MethodGet && r.URL.Path == "/admin/v1/logs" {
+		if r.Method == http.MethodGet && r.URL.Path == "/admin/v2/logs" {
 			level = slog.LevelDebug
 		}
 		operator := r.Header.Get(operatorHeader)
@@ -193,6 +196,9 @@ const (
 	causeOptionalIEIncorrect  = "OPTIONAL_IE_INCORRECT"
 	causeUserNotFound         = "USER_NOT_FOUND"
 	causeSubscriberExists     = "SUBSCRIBER_ALREADY_EXISTS"
+	causeSubscriberActive     = "SUBSCRIBER_ACTIVE"
+	causeSubscriberTerminated = "SUBSCRIBER_TERMINATED"
+	causeTransitionNotAllowed = "STATE_TRANSITION_NOT_ALLOWED"
 	causeClientNotFound       = "CLIENT_NOT_FOUND"
 	causeCertRegistered       = "CERT_ALREADY_REGISTERED"
 	causeInvalidCertificate   = "INVALID_CERTIFICATE"

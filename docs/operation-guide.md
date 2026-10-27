@@ -15,7 +15,6 @@
 | リスナー | コンテナ内のポート | ホスト側の公開先（既定） | 用途 |
 |---|---|---|---|
 | AV / mTLS | 8443 | `0.0.0.0:8443` | 認証ベクターAPI |
-| AV / 平文HTTP | 8080 | `127.0.0.1:8080` | 認証ベクターAPI（既定で無効） |
 | 管理 | 9443 | `127.0.0.1:9443` | 管理API（管理クライアントを設定するまで起動しない） |
 
 ホスト OS は Debian を主対象とする。ホストに必要なのは Docker Engine と compose プラグインだけである。
@@ -39,7 +38,7 @@ CA は使わない。サーバー証明書は自己署名または持ち込み�
 
 | 証明書 | 作り直し方 | 反映 |
 |---|---|---|
-| AV 用 | 管理API の `DELETE /admin/v1/av-server-certificate` | 即時。以後の新しい接続から |
+| AV 用 | 管理API の `DELETE /admin/v2/av-server-certificate` | 即時。以後の新しい接続から |
 | 管理API 用 | `admin-cert reset` コマンド | サーバーの再起動後 |
 
 ```bash
@@ -64,7 +63,7 @@ docker compose run --rm --no-deps -T aka-vecgen client gen-cert -name radius > r
 
 ### 2.3 クライアント証明書の更新
 
-AVクライアントの証明書を更新するときは、管理API の `PUT /admin/v1/clients/{clientId}/certificate` で差し替える。クライアントID が変わらないので、各加入者の許可クライアントの設定はそのまま使える。差し替えた時点で、古い証明書では接続できなくなる。
+AVクライアントの証明書を更新するときは、管理API の `PUT /admin/v2/clients/{clientId}/certificate` で差し替える。クライアントID が変わらないので、各加入者の許可クライアントの設定はそのまま使える。差し替えた時点で、古い証明書では接続できなくなる。
 
 管理クライアントの証明書を更新するときは、`.env` の `VECGEN_ADMIN_CLIENTS` のフィンガープリントを書き換えて、サーバーを再起動する。切り替え中は、新旧 2 つのフィンガープリントを別の識別名で並べておける。
 
@@ -119,21 +118,13 @@ networks:
 | 接続先 | URL |
 |---|---|
 | 認証ベクターAPI（mTLS） | `https://aka-vecgen:8443/nudm-ueau/v1/...` |
-| 認証ベクターAPI（平文HTTP） | `http://aka-vecgen:8080/nudm-ueau/v1/...` |
-| 管理API | `https://aka-vecgen:9443/admin/v1/...` |
+| 管理API | `https://aka-vecgen:9443/admin/v2/...` |
 
 - `aka-vecgen` は、サーバー証明書の SAN の既定値に入っている。
 - 共有ネットワークは aka-vecgen の compose が作るので、相手側より先に起動する。
 - Valkey は共有ネットワークに参加しないので、相手側のコンテナからは届かない。
 
-### 4.1 平文HTTP を使う場合
-
-平文HTTP では CK / IK が暗号化されずに流れる。同一ホスト内の通信に限って使う。
-
-1. `.env` で `VECGEN_AV_PLAIN_ADDR=:8080` を設定し、起動し直す。
-2. 払い出しを許可する加入者ごとに、平文HTTP の許可（`allowPlain`）を立てる。
-
-平文HTTP ではクライアントを識別できないので、許可は加入者単位になる。共有ネットワークに参加しているコンテナは、どれでも許可された加入者のベクターを取得できる。`VECGEN_AV_PLAIN_PUBLISH` はループバックのままにしておく。
+平文HTTP のリスナーは、MVP セットの段階 2-1 でなくした（認証ベクターAPI の契約は mTLS だけ）。同じホストのクライアントも mTLS でつなぐ。
 
 ## 5. 公開範囲
 
@@ -142,7 +133,6 @@ Docker が公開したポートは、ufw の規則を通らずに外部から届
 | 変数 | 既定値 | 考え方 |
 |---|---|---|
 | `VECGEN_AV_TLS_PUBLISH` | `0.0.0.0:8443` | 外部の AVクライアントから使う場合はこのまま。同一ホスト内だけで使うなら `127.0.0.1:8443` にする |
-| `VECGEN_AV_PLAIN_PUBLISH` | `127.0.0.1:8080` | 変えない |
 | `VECGEN_ADMIN_PUBLISH` | `127.0.0.1:9443` | BFF が別ホストにある場合だけ変える。VPN 側のアドレスに限定するのが望ましい |
 
 mTLS のリスナーは、登録済みの証明書を提示しない接続を TLS ハンドシェイクで拒否する。
@@ -158,8 +148,8 @@ mTLS のリスナーは、登録済みの証明書を提示しない接続を TL
 docker compose logs -f aka-vecgen
 ```
 
-- 管理API では、`GET /admin/v1/logs` でメモリ上の直近分、`GET /admin/v1/audit-logs` で監査ログを取得できる。
-- 管理API のリクエストは `admin request completed` として残る（`GET /admin/v1/logs` だけは debug レベルなので、既定の `info` では残らない）。管理クライアントが `X-Trace-ID` ヘッダーでトレースID を渡すと、その値がこのログと監査ログ（`traceId`）に残り、管理 GUI や統合API の記録と突き合わせられる。
+- 管理API では、`GET /admin/v2/logs` でメモリ上の直近分、`GET /admin/v2/audit-logs` で監査ログを取得できる。
+- 管理API のリクエストは `admin request completed` として残る（`GET /admin/v2/logs` だけは debug レベルなので、既定の `info` では残らない）。管理クライアントが `X-Trace-ID` ヘッダーでトレースID を渡すと、その値がこのログと監査ログ（`traceId`）に残り、管理 GUI や統合API の記録と突き合わせられる。
 - 認証ベクターの払い出しのログ（`av generated`、`av request rejected` など）には `trace_id` が付く。本PoCの vector-gateway が `X-Trace-ID` で渡した値なので、本PoC のログの `trace_id` で 1 回の認証を追える。
 - 監査ログは `VECGEN_AUDIT_MAX` 件（既定 10000）を超えると古いものから消える。長く残したい場合は、Docker のログを外部に保存する。
 - コマンド（`subscriber`、`client`）での操作は、監査ログに残らない。日常の操作は管理API で行う。
@@ -235,7 +225,8 @@ VECGEN_VERSION=$(git rev-parse --short HEAD) docker compose up -d --build
 |---|---|
 | mTLS で接続できない（ハンドシェイクで切れる） | サーバーログの `client certificate rejected` の `reason`。`not registered` は未登録、`client disabled` は無効化、`outside validity period` は期限切れ |
 | サーバー証明書の検証に失敗する | クライアントに設定した証明書が現在のものか（`av-cert` / `admin-cert` で取り出して比べる）。接続に使う名前が SAN に入っているか |
-| 403 `AUTHENTICATION_REJECTED` | 加入者の許可クライアントにそのクライアントID が入っているか。平文HTTP の場合は加入者の `allowPlain` |
+| 403 `AUTHENTICATION_REJECTED` | 応答は理由を区別しない（一般的な拒否）。サーバーログの `av request rejected` の `reason` で理由を確かめる: `not_found`（未登録）、`client_not_allowed`（許可クライアントにそのクライアントID がない）、`inactive`・`terminated`（加入者の状態）、`auts_invalid`（再同期の AUTS が合わない）、`client_disabled`（クライアントが無効・削除済み）、`client_unknown`（証明書を識別できない） |
+| 400 `MANDATORY_IE_MISSING`（EAP-AKA'） | リクエストに `anId` があるか（EAP-AKA' では必須） |
 | 400 `OPTIONAL_IE_INCORRECT`（EAP-AKA'） | リクエストの `anId` が、クライアントに設定した Network Name（未設定なら `WLAN`）と一致しているか |
 | 端末が同期失敗を繰り返す | 加入者の SQN 増加タイプが USIM の SQN 検証方式に合っているか |
 | 管理API に接続できない | `VECGEN_ADMIN_CLIENTS` が設定されているか。起動ログに `admin api is disabled` が出ていないか |

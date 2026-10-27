@@ -27,9 +27,6 @@ func healthcheckCommand(ctx context.Context) error {
 // listenerAddrs は、設定から有効なリスナーの待ち受けアドレスを返す。
 func listenerAddrs(cfg config.Config) []string {
 	addrs := []string{cfg.AVTLSAddr}
-	if cfg.AVPlainAddr != "" {
-		addrs = append(addrs, cfg.AVPlainAddr)
-	}
 	if len(cfg.AdminClients) > 0 {
 		addrs = append(addrs, cfg.AdminAddr)
 	}

@@ -8,7 +8,9 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/oyaguma3/aka-vecgen/internal/aka"
 	"github.com/oyaguma3/aka-vecgen/internal/store"
@@ -21,10 +23,11 @@ var (
 
 type subscriberJSON struct {
 	IMSI             string    `json:"imsi"`
+	State            string    `json:"state"`
+	StateChangedAt   time.Time `json:"stateChangedAt"`
 	SQN              string    `json:"sqn"`
 	AMF              string    `json:"amf"`
 	SQNType          string    `json:"sqnType"`
-	AllowPlain       bool      `json:"allowPlain"`
 	AllowedClientIDs []int64   `json:"allowedClientIds"`
 	CreatedAt        time.Time `json:"createdAt"`
 	UpdatedAt        time.Time `json:"updatedAt"`
@@ -34,11 +37,20 @@ type subscriberCreateJSON struct {
 	IMSI             *string  `json:"imsi"`
 	Ki               *string  `json:"ki"`
 	OPc              *string  `json:"opc"`
+	State            *string  `json:"state"`
 	SQN              *string  `json:"sqn"`
 	AMF              *string  `json:"amf"`
 	SQNType          *string  `json:"sqnType"`
-	AllowPlain       *bool    `json:"allowPlain"`
 	AllowedClientIDs *[]int64 `json:"allowedClientIds"`
+}
+
+type stateChangeJSON struct {
+	State  *string `json:"state"`
+	Reason *string `json:"reason"`
+}
+
+type reinstateJSON struct {
+	Reason *string `json:"reason"`
 }
 
 type subscriberListJSON struct {
@@ -65,10 +77,11 @@ func toSubscriberJSON(sub store.Subscriber, clientIDs []int64) subscriberJSON {
 	}
 	return subscriberJSON{
 		IMSI:             sub.IMSI,
+		State:            string(sub.State),
+		StateChangedAt:   sub.StateChangedAt,
 		SQN:              formatSQN(sub.SQN),
 		AMF:              formatAMF(sub.AMF),
 		SQNType:          string(sub.SQNType),
-		AllowPlain:       sub.AllowPlain,
 		AllowedClientIDs: allowed,
 		CreatedAt:        sub.CreatedAt,
 		UpdatedAt:        sub.UpdatedAt,
@@ -77,21 +90,39 @@ func toSubscriberJSON(sub store.Subscriber, clientIDs []int64) subscriberJSON {
 
 // subscriberState は監査ログに残す加入者の状態。Ki と OPc は含めない。
 type subscriberState struct {
+	State            string  `json:"state"`
 	SQN              string  `json:"sqn"`
 	AMF              string  `json:"amf"`
 	SQNType          string  `json:"sqnType"`
-	AllowPlain       bool    `json:"allowPlain"`
 	AllowedClientIDs []int64 `json:"allowedClientIds"`
 }
 
 func stateOf(sub store.Subscriber) subscriberState {
 	return subscriberState{
+		State:            string(sub.State),
 		SQN:              formatSQN(sub.SQN),
 		AMF:              formatAMF(sub.AMF),
 		SQNType:          string(sub.SQNType),
-		AllowPlain:       sub.AllowPlain,
 		AllowedClientIDs: sub.AllowedClientIDs,
 	}
+}
+
+// maxReasonLen は状態の変更の理由の文字数の上限。
+const maxReasonLen = 500
+
+// parseReason は理由を読む。required なら空を断る。
+func parseReason(s *string, required bool, v *validation) string {
+	if s == nil || strings.TrimSpace(*s) == "" {
+		if required {
+			v.missing = append(v.missing, invalidParam{"reason", "is required"})
+		}
+		return ""
+	}
+	if utf8.RuneCountInString(*s) > maxReasonLen {
+		v.optional = append(v.optional, invalidParam{"reason", "must be at most 500 characters"})
+		return ""
+	}
+	return *s
 }
 
 func parseHex(s string, size int) ([]byte, bool) {
@@ -190,6 +221,15 @@ func (h *Handler) createSubscriber(w http.ResponseWriter, r *http.Request) {
 	} else if sub.OPc, ok = parseHex(*body.OPc, 16); !ok {
 		v.mandatory = append(v.mandatory, invalidParam{"opc", "must be 32 hex digits"})
 	}
+	// 登録のときの状態は active か inactive（設計概要 §7.1）。
+	switch {
+	case body.State == nil:
+		v.missing = append(v.missing, invalidParam{"state", "is required"})
+	case *body.State != string(store.StateActive) && *body.State != string(store.StateInactive):
+		v.mandatory = append(v.mandatory, invalidParam{"state", "must be active or inactive"})
+	default:
+		sub.State = store.State(*body.State)
+	}
 	if body.SQN != nil {
 		if sub.SQN, ok = parseSQN(*body.SQN); !ok {
 			v.optional = append(v.optional, invalidParam{"sqn", "must be 12 hex digits"})
@@ -204,9 +244,6 @@ func (h *Handler) createSubscriber(w http.ResponseWriter, r *http.Request) {
 		if sub.SQNType = aka.SQNType(*body.SQNType); !sub.SQNType.Valid() {
 			v.optional = append(v.optional, invalidParam{"sqnType", "must be inc1, inc32 or inc33"})
 		}
-	}
-	if body.AllowPlain != nil {
-		sub.AllowPlain = *body.AllowPlain
 	}
 	if body.AllowedClientIDs != nil {
 		if sub.AllowedClientIDs, ok = normalizeClientIDs(*body.AllowedClientIDs); !ok {
@@ -237,7 +274,7 @@ func (h *Handler) createSubscriber(w http.ResponseWriter, r *http.Request) {
 		h.internalError(w, r, err)
 		return
 	}
-	w.Header().Set("Location", "/admin/v1/subscribers/"+sub.IMSI)
+	w.Header().Set("Location", "/admin/v2/subscribers/"+sub.IMSI)
 	// 登録時に存在を確認済みなので、指定された ID をそのまま返す。
 	writeJSON(w, http.StatusCreated, toSubscriberJSON(created, created.AllowedClientIDs))
 }
@@ -292,16 +329,16 @@ func (h *Handler) updateSubscriber(w http.ResponseWriter, r *http.Request) {
 
 	var v validation
 	var patch store.SubscriberPatch
-	var ok bool
-	if s := patchField[string](fields, "ki", &v); s != nil {
-		if patch.Ki, ok = parseHex(*s, 16); !ok {
-			v.optional = append(v.optional, invalidParam{"ki", "must be 32 hex digits"})
+	// 鍵は登録の後に変えない（設計概要の決定事項 4）。状態は専用の口で変える。
+	for _, name := range []string{"ki", "opc"} {
+		if _, ok := fields[name]; ok {
+			delete(fields, name)
+			v.optional = append(v.optional, invalidParam{name, "cannot be changed after registration; set the subscriber inactive, delete it and register it again"})
 		}
 	}
-	if s := patchField[string](fields, "opc", &v); s != nil {
-		if patch.OPc, ok = parseHex(*s, 16); !ok {
-			v.optional = append(v.optional, invalidParam{"opc", "must be 32 hex digits"})
-		}
+	if _, ok := fields["state"]; ok {
+		delete(fields, "state")
+		v.optional = append(v.optional, invalidParam{"state", "use PUT /subscribers/{imsi}/state or POST /subscribers/{imsi}/reinstate"})
 	}
 	if s := patchField[string](fields, "sqn", &v); s != nil {
 		if sqn, ok := parseSQN(*s); ok {
@@ -324,7 +361,6 @@ func (h *Handler) updateSubscriber(w http.ResponseWriter, r *http.Request) {
 			v.optional = append(v.optional, invalidParam{"sqnType", "must be inc1, inc32 or inc33"})
 		}
 	}
-	patch.AllowPlain = patchField[bool](fields, "allowPlain", &v)
 	if ids := patchField[[]int64](fields, "allowedClientIds", &v); ids != nil {
 		if norm, ok := normalizeClientIDs(*ids); ok {
 			patch.AllowedClientIDs = &norm
@@ -347,6 +383,9 @@ func (h *Handler) updateSubscriber(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrNotFound):
 		notFoundSubscriber().write(w)
 		return
+	case errors.Is(err, store.ErrTerminated):
+		newProblem(http.StatusConflict, causeSubscriberTerminated, "a terminated subscriber cannot be changed").write(w)
+		return
 	case errors.Is(err, store.ErrUnknownClient):
 		badParams(causeClientNotFound, invalidParam{"allowedClientIds", err.Error()}).write(w)
 		return
@@ -355,14 +394,8 @@ func (h *Handler) updateSubscriber(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 監査ログには、指定された項目の前後の値を残す。Ki と OPc は変更の有無だけを残す。
+	// 監査ログには、指定された項目の前後の値を残す。
 	detail := map[string]any{}
-	if patch.Ki != nil {
-		detail["kiChanged"] = true
-	}
-	if patch.OPc != nil {
-		detail["opcChanged"] = true
-	}
 	if patch.SQN != nil {
 		detail["sqn"] = change{formatSQN(before.SQN), formatSQN(*patch.SQN)}
 	}
@@ -371,9 +404,6 @@ func (h *Handler) updateSubscriber(w http.ResponseWriter, r *http.Request) {
 	}
 	if patch.SQNType != nil {
 		detail["sqnType"] = change{before.SQNType, *patch.SQNType}
-	}
-	if patch.AllowPlain != nil {
-		detail["allowPlain"] = change{before.AllowPlain, *patch.AllowPlain}
 	}
 	if patch.AllowedClientIDs != nil {
 		detail["allowedClientIds"] = change{before.AllowedClientIDs, *patch.AllowedClientIDs}
@@ -391,17 +421,111 @@ func (h *Handler) deleteSubscriber(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err := h.Store.DeleteSubscriber(r.Context(), sub.IMSI)
-	if errors.Is(err, store.ErrNotFound) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
 		notFoundSubscriber().write(w)
 		return
-	}
-	if err != nil {
+	case errors.Is(err, store.ErrActive):
+		newProblem(http.StatusConflict, causeSubscriberActive, "an active subscriber cannot be deleted; set it inactive or terminated first").write(w)
+		return
+	case err != nil:
 		h.internalError(w, r, err)
 		return
 	}
 	// 削除して再登録することで SQN / AMF を実質的に変更した操作を追跡できるよう、削除時点の値を残す。
 	h.audit(r, "subscriber.delete", sub.IMSI, stateOf(sub))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// setSubscriberState は状態を変える（active ⇔ inactive、terminated へ）。terminated からは reinstate だけで戻す。
+// 同じ状態への変更は何もせず 200 を返し、監査ログには残す（設計概要 §7.1）。
+func (h *Handler) setSubscriberState(w http.ResponseWriter, r *http.Request) {
+	var body stateChangeJSON
+	if p := decodeBody(w, r, &body); p != nil {
+		p.write(w)
+		return
+	}
+	var v validation
+	var to store.State
+	switch {
+	case body.State == nil:
+		v.missing = append(v.missing, invalidParam{"state", "is required"})
+	case !store.State(*body.State).Valid():
+		v.mandatory = append(v.mandatory, invalidParam{"state", "must be active, inactive or terminated"})
+	default:
+		to = store.State(*body.State)
+	}
+	reason := parseReason(body.Reason, false, &v)
+	if p := v.problem(); p != nil {
+		p.write(w)
+		return
+	}
+	imsi := r.PathValue("imsi")
+	if !imsiPattern.MatchString(imsi) {
+		notFoundSubscriber().write(w)
+		return
+	}
+	from, unchanged, err := h.Store.SetState(r.Context(), imsi, to)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		notFoundSubscriber().write(w)
+		return
+	case errors.Is(err, store.ErrTransitionNotAllowed):
+		newProblem(http.StatusConflict, causeTransitionNotAllowed,
+			"a terminated subscriber can only be returned to inactive with POST /subscribers/{imsi}/reinstate").write(w)
+		return
+	case err != nil:
+		h.internalError(w, r, err)
+		return
+	}
+	detail := map[string]any{"state": change{from, to}}
+	if unchanged {
+		detail["unchanged"] = true
+	}
+	if reason != "" {
+		detail["reason"] = reason
+	}
+	h.audit(r, "subscriber.state", imsi, detail)
+	if after, ok := h.loadSubscriber(w, r); ok {
+		h.writeSubscriber(w, r, after)
+	}
+}
+
+// reinstateSubscriber は terminated の加入者を inactive に戻す。理由は必須（設計概要 §7.2）。
+// システム管理者だけに許すことは aka-ossbss が守る。
+func (h *Handler) reinstateSubscriber(w http.ResponseWriter, r *http.Request) {
+	var body reinstateJSON
+	if p := decodeBody(w, r, &body); p != nil {
+		p.write(w)
+		return
+	}
+	var v validation
+	reason := parseReason(body.Reason, true, &v)
+	if p := v.problem(); p != nil {
+		p.write(w)
+		return
+	}
+	imsi := r.PathValue("imsi")
+	if !imsiPattern.MatchString(imsi) {
+		notFoundSubscriber().write(w)
+		return
+	}
+	from, err := h.Store.Reinstate(r.Context(), imsi)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		notFoundSubscriber().write(w)
+		return
+	case errors.Is(err, store.ErrTransitionNotAllowed):
+		newProblem(http.StatusConflict, causeTransitionNotAllowed, "only a terminated subscriber can be reinstated").write(w)
+		return
+	case err != nil:
+		h.internalError(w, r, err)
+		return
+	}
+	h.audit(r, "subscriber.reinstate", imsi, map[string]any{"state": change{from, store.StateInactive}, "reason": reason})
+	if after, ok := h.loadSubscriber(w, r); ok {
+		h.writeSubscriber(w, r, after)
+	}
 }
 
 func (h *Handler) getSubscriberKeys(w http.ResponseWriter, r *http.Request) {

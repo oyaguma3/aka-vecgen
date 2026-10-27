@@ -20,42 +20,46 @@ type Allocation struct {
 
 // 許可判定と SQN の更新を原子的に行う。仕様は docs/data-model.md の 4.2 を参照。
 //
-// KEYS: sub:{imsi}, sub:{imsi}:clients, client:{id}（平文HTTP の場合は省略）
+// 判定の順は認証ベクターAPI の契約 §9.2 のとおり。加入者に依らない検査（ネットワーク名）を先に行い、
+// 加入者に依る検査（有無・クライアントの有効・許可・状態）はどれも拒否の理由だけを返す。
+// 呼び出し側はそれらを同じ一般的な拒否にする。
+//
+// KEYS: sub:{imsi}, sub:{imsi}:clients, client:{id}
 // ARGV:
 //
-//	[1] クライアントID。平文HTTP の場合は空文字列
+//	[1] クライアントID
 //	[2] 生成数 n。0 なら SQN を進めずに現在の値を返す
 //	[3] 再同期で置き換える SQN。通常時は空文字列
-//	[4] 要求された Network Name。空文字列なら照合しない
+//	[4] 要求された Network Name（anId）。空文字列なら照合しない（EAP-AKA' 以外）
 //	[5] Network Name の既定値
 var allocateScript = valkey.NewLuaScript(`
 local sub = KEYS[1]
-if redis.call('EXISTS', sub) == 0 then
-  return {'NOT_FOUND'}
-end
-
+local c = redis.call('HMGET', KEYS[3], 'enabled', 'network_name')
 local network_name = ARGV[5]
-if ARGV[1] == '' then
-  if redis.call('HGET', sub, 'allow_plain') ~= '1' then
-    return {'FORBIDDEN'}
-  end
-else
-  local c = redis.call('HMGET', KEYS[3], 'enabled', 'network_name')
-  if c[1] ~= '1' then
-    return {'FORBIDDEN'}
-  end
-  if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 0 then
-    return {'FORBIDDEN'}
-  end
-  if c[2] and c[2] ~= '' then
-    network_name = c[2]
-  end
+if c[2] and c[2] ~= '' then
+  network_name = c[2]
 end
 if ARGV[4] ~= '' and ARGV[4] ~= network_name then
   return {'NETWORK_NAME_MISMATCH'}
 end
 
-local f = redis.call('HMGET', sub, 'sqn', 'ki', 'opc', 'amf', 'sqn_type')
+if redis.call('EXISTS', sub) == 0 then
+  return {'NOT_FOUND'}
+end
+if c[1] ~= '1' then
+  return {'CLIENT_DISABLED'}
+end
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 0 then
+  return {'FORBIDDEN'}
+end
+local f = redis.call('HMGET', sub, 'sqn', 'ki', 'opc', 'amf', 'sqn_type', 'state')
+if f[6] == 'terminated' then
+  return {'TERMINATED'}
+end
+if f[6] ~= 'active' then
+  return {'INACTIVE'}
+end
+
 local base = tonumber(f[1])
 if ARGV[3] ~= '' then
   base = tonumber(ARGV[3])
@@ -84,7 +88,7 @@ return {'OK', string.format('%.0f', base), f[2], f[3], f[4], f[5], network_name}
 // AllocateRequest は SQN の払い出し要求。
 type AllocateRequest struct {
 	IMSI string
-	// ClientID は mTLS で識別したクライアントID。平文HTTP の場合は 0。
+	// ClientID は mTLS で識別したクライアントID。
 	ClientID int64
 	// N は生成数。0 なら SQN を進めずに現在の値と鍵情報だけを返す。
 	N int
@@ -97,15 +101,12 @@ type AllocateRequest struct {
 }
 
 // Allocate は加入者への払い出しが許可されているかを確認し、SQN を N 個分進める。
-// 加入者がなければ ErrNotFound、許可されていなければ ErrForbidden、
-// Network Name が一致しなければ ErrNetworkNameMismatch を返す。
+// Network Name が一致しなければ ErrNetworkNameMismatch（加入者を調べる前に判定する）、
+// 加入者がなければ ErrNotFound、クライアントが無効なら ErrClientDisabled、許可されていなければ ErrForbidden、
+// 加入者が inactive なら ErrInactive、terminated なら ErrTerminated を返す。
 func (s *Store) Allocate(ctx context.Context, req AllocateRequest) (Allocation, error) {
-	keys := []string{subKey(req.IMSI), subClientsKey(req.IMSI)}
-	clientID := ""
-	if req.ClientID != 0 {
-		clientID = strconv.FormatInt(req.ClientID, 10)
-		keys = append(keys, clientKey(req.ClientID))
-	}
+	keys := []string{subKey(req.IMSI), subClientsKey(req.IMSI), clientKey(req.ClientID)}
+	clientID := strconv.FormatInt(req.ClientID, 10)
 	resync := ""
 	if req.ResyncSQN != nil {
 		resync = strconv.FormatUint(*req.ResyncSQN&aka.SQNMask, 10)
@@ -123,8 +124,14 @@ func (s *Store) Allocate(ctx context.Context, req AllocateRequest) (Allocation, 
 	case "OK":
 	case "NOT_FOUND":
 		return Allocation{}, ErrNotFound
+	case "CLIENT_DISABLED":
+		return Allocation{}, ErrClientDisabled
 	case "FORBIDDEN":
 		return Allocation{}, ErrForbidden
+	case "INACTIVE":
+		return Allocation{}, ErrInactive
+	case "TERMINATED":
+		return Allocation{}, ErrTerminated
 	case "NETWORK_NAME_MISMATCH":
 		return Allocation{}, ErrNetworkNameMismatch
 	default:

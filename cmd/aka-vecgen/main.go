@@ -104,16 +104,15 @@ func serve(ctx context.Context) error {
 		return err
 	}
 	admin := &adminapi.Handler{
-		Store:          st,
-		Certs:          srv,
-		Logs:           logs,
-		Log:            log.With("listener", "admin"),
-		MgmtClient:     srv.AdminClientName,
-		Version:        version,
-		BootID:         uuid.New().String(),
-		StartedAt:      time.Now().UTC(),
-		AVPlainEnabled: cfg.AVPlainAddr != "",
-		AuditMaxLen:    cfg.AuditMaxLen,
+		Store:       st,
+		Certs:       srv,
+		Logs:        logs,
+		Log:         log.With("listener", "admin"),
+		MgmtClient:  srv.AdminClientName,
+		Version:     version,
+		BootID:      uuid.New().String(),
+		StartedAt:   time.Now().UTC(),
+		AuditMaxLen: cfg.AuditMaxLen,
 	}
 	log.Info("starting", "version", version, "boot_id", admin.BootID)
 	return srv.Run(ctx, admin.Routes())

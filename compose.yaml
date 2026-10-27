@@ -22,7 +22,6 @@ services:
       VECGEN_VALKEY_ADDR: valkey:6379
       VECGEN_VALKEY_PASSWORD: ${VALKEY_PASSWORD:?.env に VALKEY_PASSWORD を設定してください}
       VECGEN_AV_TLS_ADDR: ":8443"
-      VECGEN_AV_PLAIN_ADDR: ${VECGEN_AV_PLAIN_ADDR:-}
       VECGEN_AV_TLS_HOSTS: ${VECGEN_AV_TLS_HOSTS:-localhost,127.0.0.1,aka-vecgen}
       VECGEN_ADMIN_ADDR: ":9443"
       VECGEN_ADMIN_CLIENTS: ${VECGEN_ADMIN_CLIENTS:-}
@@ -33,7 +32,6 @@ services:
     ports:
       # Docker が公開したポートは ufw の規則を通らない。公開範囲はここのバインド先で制御する。
       - "${VECGEN_AV_TLS_PUBLISH:-0.0.0.0:8443}:8443"
-      - "${VECGEN_AV_PLAIN_PUBLISH:-127.0.0.1:8080}:8080"
       - "${VECGEN_ADMIN_PUBLISH:-127.0.0.1:9443}:9443"
     networks:
       - default

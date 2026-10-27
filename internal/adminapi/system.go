@@ -20,7 +20,6 @@ type statusJSON struct {
 	StartedAt                   time.Time `json:"startedAt"`
 	SubscriberCount             int64     `json:"subscriberCount"`
 	ClientCount                 int64     `json:"clientCount"`
-	AVPlainEnabled              bool      `json:"avPlainEnabled"`
 	AVServerCertificateNotAfter time.Time `json:"avServerCertificateNotAfter"`
 }
 
@@ -51,7 +50,6 @@ func (h *Handler) getStatus(w http.ResponseWriter, r *http.Request) {
 		StartedAt:                   h.StartedAt,
 		SubscriberCount:             subs,
 		ClientCount:                 clients,
-		AVPlainEnabled:              h.AVPlainEnabled,
 		AVServerCertificateNotAfter: cert.NotAfter.UTC(),
 	})
 }

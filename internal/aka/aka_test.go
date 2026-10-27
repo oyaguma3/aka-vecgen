@@ -31,8 +31,8 @@ var milenageTestSets = []struct {
 }{
 	{set: 1, k: "465b5ce8b199b49faa5f0a2ee238a6bc", rand: "23553cbe9637a89d218ae64dae47bf35", sqn: "ff9bb4d0b607", amf: "b9b9", opc: "cd63cb71954a9f4e48a5994e37a02baf",
 		f1: "4a9ffac354dfafb3", f1star: "01cfaf9ec4e871e9", f2: "a54211d5e3ba50bf", f3: "b40ba9a3c58b2a05bbf0d987b21bf8cb", f4: "f769bcd751044604127672711c6d3441", f5: "aa689c648370", f5star: "451e8beca43b"},
-	{set: 2, k: "465b5ce8b199b49faa5f0a2ee238a6bc", rand: "23553cbe9637a89d218ae64dae47bf35", sqn: "ff9bb4d0b607", amf: "b9b9", opc: "cd63cb71954a9f4e48a5994e37a02baf",
-		f1: "4a9ffac354dfafb3", f1star: "01cfaf9ec4e871e9", f2: "a54211d5e3ba50bf", f3: "b40ba9a3c58b2a05bbf0d987b21bf8cb", f4: "f769bcd751044604127672711c6d3441", f5: "aa689c648370", f5star: "451e8beca43b"},
+	{set: 2, k: "0396eb317b6d1c36f19c1c84cd6ffd16", rand: "c00d603103dcee52c4478119494202e8", sqn: "fd8eef40df7d", amf: "af17", opc: "53c15671c60a4b731c55b4a441c0bde2",
+		f1: "5df5b31807e258b0", f1star: "a8c016e51ef4a343", f2: "d3a628ed988620f0", f3: "58c433ff7a7082acd424220f2b67c556", f4: "21a8c1f929702adb3e738488b9f5c5da", f5: "c47783995f72", f5star: "30f1197061c1"},
 	{set: 3, k: "fec86ba6eb707ed08905757b1bb44b8f", rand: "9f7c8d021accf4db213ccff0c7f71a6a", sqn: "9d0277595ffc", amf: "725c", opc: "1006020f0a478bf6b699f15c062e42b3",
 		f1: "9cabc3e99baf7281", f1star: "95814ba2b3044324", f2: "8011c48c0c214ed2", f3: "5dbdbb2954e8f3cde665b046179a5098", f4: "59a92d3b476a0443487055cf88b2307b", f5: "33484dc2136b", f5star: "deacdd848cc6"},
 	{set: 4, k: "9e5944aea94b81165c82fbf9f32db751", rand: "ce83dbc54ac0274a157c17f80d017bd6", sqn: "0b604a81eca8", amf: "9e09", opc: "a64a507ae1a2a98bb88eb4210135dc87",

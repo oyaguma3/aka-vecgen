@@ -44,7 +44,19 @@ func testSubscriber(imsi string, typ aka.SQNType) Subscriber {
 		OPc:     []byte("fedcba9876543210"),
 		AMF:     0x8000,
 		SQNType: typ,
+		State:   StateActive,
 	}
+}
+
+// createAllowed は、クライアントを 1 つ作り、そのクライアントに払い出しを許した加入者を登録して、クライアントID を返す。
+func createAllowed(t *testing.T, s *Store, sub Subscriber) int64 {
+	t.Helper()
+	c := addClient(t, s, "client-"+sub.IMSI, "")
+	sub.AllowedClientIDs = []int64{c.ID}
+	if err := s.CreateSubscriber(t.Context(), sub); err != nil {
+		t.Fatal(err)
+	}
+	return c.ID
 }
 
 func testCert(t *testing.T, name string) *x509.Certificate {
@@ -77,7 +89,6 @@ func TestSubscriberLifecycle(t *testing.T) {
 
 	sub := testSubscriber("440100000000001", aka.SQNInc32)
 	sub.SQN = 0x20
-	sub.AllowPlain = true
 	sub.AllowedClientIDs = []int64{c2.ID, c1.ID}
 	if err := s.CreateSubscriber(ctx, sub); err != nil {
 		t.Fatal(err)
@@ -91,7 +102,7 @@ func TestSubscriberLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(got.Ki) != string(sub.Ki) || string(got.OPc) != string(sub.OPc) || got.SQN != 0x20 ||
-		got.AMF != 0x8000 || got.SQNType != aka.SQNInc32 || !got.AllowPlain {
+		got.AMF != 0x8000 || got.SQNType != aka.SQNInc32 || got.State != StateActive || got.StateChangedAt.IsZero() {
 		t.Errorf("GetSubscriber = %+v", got)
 	}
 	if want := []int64{c1.ID, c2.ID}; !slices.Equal(got.AllowedClientIDs, want) {
@@ -108,6 +119,20 @@ func TestSubscriberLifecycle(t *testing.T) {
 		t.Errorf("unknown client: err = %v, want ErrUnknownClient", err)
 	}
 
+	// 登録のときの状態は active か inactive だけ。
+	term := testSubscriber("440100000000003", aka.SQNInc32)
+	term.State = StateTerminated
+	if err := s.CreateSubscriber(ctx, term); err == nil {
+		t.Error("create as terminated: err = nil, want an error")
+	}
+
+	// active は物理削除できない。
+	if err := s.DeleteSubscriber(ctx, sub.IMSI); !errors.Is(err, ErrActive) {
+		t.Fatalf("delete active: err = %v, want ErrActive", err)
+	}
+	if _, _, err := s.SetState(ctx, sub.IMSI, StateInactive); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.DeleteSubscriber(ctx, sub.IMSI); err != nil {
 		t.Fatal(err)
 	}
@@ -128,14 +153,11 @@ func TestAllocateAdvancesSQN(t *testing.T) {
 		imsi := fmt.Sprintf("44010000000001%d", i)
 		sub := testSubscriber(imsi, typ)
 		sub.SQN = 30 // inc33 で IND が 31 から 0 に回る箇所を通る
-		sub.AllowPlain = true
-		if err := s.CreateSubscriber(ctx, sub); err != nil {
-			t.Fatal(err)
-		}
+		client := createAllowed(t, s, sub)
 
 		base := sub.SQN
 		for _, n := range []int{1, 5, 2, 1, 3} {
-			a, err := s.Allocate(ctx, AllocateRequest{IMSI: imsi, N: n, DefaultNetworkName: "WLAN"})
+			a, err := s.Allocate(ctx, AllocateRequest{IMSI: imsi, ClientID: client, N: n, DefaultNetworkName: "WLAN"})
 			if err != nil {
 				t.Fatalf("%s: %v", typ, err)
 			}
@@ -167,11 +189,8 @@ func TestAllocateWrapsAt48Bits(t *testing.T) {
 	ctx := t.Context()
 	sub := testSubscriber("440100000000020", aka.SQNInc32)
 	sub.SQN = aka.SQNMask - 31
-	sub.AllowPlain = true
-	if err := s.CreateSubscriber(ctx, sub); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Allocate(ctx, AllocateRequest{IMSI: sub.IMSI, N: 1}); err != nil {
+	client := createAllowed(t, s, sub)
+	if _, err := s.Allocate(ctx, AllocateRequest{IMSI: sub.IMSI, ClientID: client, N: 1}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetSubscriber(ctx, sub.IMSI)
@@ -188,13 +207,10 @@ func TestAllocateProbeAndResync(t *testing.T) {
 	ctx := t.Context()
 	sub := testSubscriber("440100000000030", aka.SQNInc32)
 	sub.SQN = 64
-	sub.AllowPlain = true
-	if err := s.CreateSubscriber(ctx, sub); err != nil {
-		t.Fatal(err)
-	}
+	client := createAllowed(t, s, sub)
 
 	// N=0 は SQN を進めない。
-	a, err := s.Allocate(ctx, AllocateRequest{IMSI: sub.IMSI, N: 0})
+	a, err := s.Allocate(ctx, AllocateRequest{IMSI: sub.IMSI, ClientID: client, N: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +222,7 @@ func TestAllocateProbeAndResync(t *testing.T) {
 	}
 
 	// 再同期では SQN を置き換えてから進める。
-	a, err = s.Allocate(ctx, AllocateRequest{IMSI: sub.IMSI, N: 2, ResyncSQN: new(uint64(3200))})
+	a, err = s.Allocate(ctx, AllocateRequest{IMSI: sub.IMSI, ClientID: client, N: 2, ResyncSQN: new(uint64(3200))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,14 +240,28 @@ func TestAllocateAuthorization(t *testing.T) {
 	allowed := addClient(t, s, "allowed", "")
 	other := addClient(t, s, "other", "")
 
+	disabled := addClient(t, s, "disabled", "")
+	if err := s.UpdateClient(ctx, disabled.ID, ClientPatch{Enabled: new(false)}); err != nil {
+		t.Fatal(err)
+	}
+
 	sub := testSubscriber("440100000000040", aka.SQNInc32)
-	sub.AllowedClientIDs = []int64{allowed.ID}
+	sub.AllowedClientIDs = []int64{allowed.ID, disabled.ID}
 	if err := s.CreateSubscriber(ctx, sub); err != nil {
 		t.Fatal(err)
 	}
-	plainOnly := testSubscriber("440100000000041", aka.SQNInc32)
-	plainOnly.AllowPlain = true
-	if err := s.CreateSubscriber(ctx, plainOnly); err != nil {
+	inactive := testSubscriber("440100000000041", aka.SQNInc32)
+	inactive.State = StateInactive
+	inactive.AllowedClientIDs = []int64{allowed.ID}
+	if err := s.CreateSubscriber(ctx, inactive); err != nil {
+		t.Fatal(err)
+	}
+	terminated := testSubscriber("440100000000042", aka.SQNInc32)
+	terminated.AllowedClientIDs = []int64{allowed.ID}
+	if err := s.CreateSubscriber(ctx, terminated); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.SetState(ctx, terminated.IMSI, StateTerminated); err != nil {
 		t.Fatal(err)
 	}
 
@@ -243,12 +273,11 @@ func TestAllocateAuthorization(t *testing.T) {
 	}{
 		{"allowed client", sub.IMSI, allowed.ID, nil},
 		{"client not in the set", sub.IMSI, other.ID, ErrForbidden},
-		{"plain HTTP without the flag", sub.IMSI, 0, ErrForbidden},
-		{"plain HTTP with the flag", plainOnly.IMSI, 0, nil},
-		// 平文HTTP の許可は、証明書で識別されたクライアントには適用しない。
-		{"client on a plain-only subscriber", plainOnly.IMSI, allowed.ID, ErrForbidden},
-		{"unknown client id", sub.IMSI, 9999, ErrForbidden},
+		{"disabled client", sub.IMSI, disabled.ID, ErrClientDisabled},
+		{"unknown client id", sub.IMSI, 9999, ErrClientDisabled},
 		{"unknown subscriber", "440100000000099", allowed.ID, ErrNotFound},
+		{"inactive subscriber", inactive.IMSI, allowed.ID, ErrInactive},
+		{"terminated subscriber", terminated.IMSI, allowed.ID, ErrTerminated},
 	}
 	for _, tt := range tests {
 		_, err := s.Allocate(ctx, AllocateRequest{IMSI: tt.imsi, ClientID: tt.clientID, N: 1})
@@ -258,16 +287,18 @@ func TestAllocateAuthorization(t *testing.T) {
 	}
 
 	// 拒否された要求は SQN を進めない。
-	if got, _ := s.GetSubscriber(ctx, sub.IMSI); got.SQN != 32 {
-		t.Errorf("SQN = %d, want 32 (one successful allocation)", got.SQN)
+	for imsi, want := range map[string]uint64{sub.IMSI: 32, inactive.IMSI: 0, terminated.IMSI: 0} {
+		if got, _ := s.GetSubscriber(ctx, imsi); got.SQN != want {
+			t.Errorf("%s: SQN = %d, want %d", imsi, got.SQN, want)
+		}
 	}
 
 	// 削除したクライアントは、許可集合に ID が残っていても拒否する。
 	if err := s.DeleteClient(ctx, allowed.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Allocate(ctx, AllocateRequest{IMSI: sub.IMSI, ClientID: allowed.ID, N: 1}); !errors.Is(err, ErrForbidden) {
-		t.Errorf("deleted client: err = %v, want ErrForbidden", err)
+	if _, err := s.Allocate(ctx, AllocateRequest{IMSI: sub.IMSI, ClientID: allowed.ID, N: 1}); !errors.Is(err, ErrClientDisabled) {
+		t.Errorf("deleted client: err = %v, want ErrClientDisabled", err)
 	}
 }
 
@@ -278,7 +309,6 @@ func TestAllocateNetworkName(t *testing.T) {
 	custom := addClient(t, s, "custom-name", "ETHERNET")
 
 	sub := testSubscriber("440100000000050", aka.SQNInc32)
-	sub.AllowPlain = true
 	sub.AllowedClientIDs = []int64{def.ID, custom.ID}
 	if err := s.CreateSubscriber(ctx, sub); err != nil {
 		t.Fatal(err)
@@ -297,7 +327,6 @@ func TestAllocateNetworkName(t *testing.T) {
 		{"per-client, not requested", custom.ID, "", "ETHERNET", nil},
 		{"per-client, matching", custom.ID, "ETHERNET", "ETHERNET", nil},
 		{"per-client, mismatch", custom.ID, "WLAN", "", ErrNetworkNameMismatch},
-		{"plain HTTP uses the default", 0, "", "WLAN", nil},
 	}
 	wantSQN := uint64(0)
 	for _, tt := range tests {
@@ -320,17 +349,18 @@ func TestAllocateNetworkName(t *testing.T) {
 	if got, _ := s.GetSubscriber(ctx, sub.IMSI); got.SQN != wantSQN {
 		t.Errorf("SQN = %d, want %d", got.SQN, wantSQN)
 	}
+	// Network Name の照合は加入者を調べる前に行う（契約 §9.2）。登録されていない IMSI でも同じ誤りになる。
+	_, err := s.Allocate(ctx, AllocateRequest{IMSI: "440100000000099", ClientID: def.ID, N: 1, NetworkName: "ETHERNET", DefaultNetworkName: "WLAN"})
+	if !errors.Is(err, ErrNetworkNameMismatch) {
+		t.Errorf("unknown subscriber, mismatch: err = %v, want ErrNetworkNameMismatch", err)
+	}
 }
 
 // 同時に払い出しても同じ SQN を二重に払い出さない。
 func TestAllocateConcurrent(t *testing.T) {
 	s := openTestStore(t)
-	ctx := t.Context()
 	sub := testSubscriber("440100000000060", aka.SQNInc33)
-	sub.AllowPlain = true
-	if err := s.CreateSubscriber(ctx, sub); err != nil {
-		t.Fatal(err)
-	}
+	client := createAllowed(t, s, sub)
 
 	const workers, perWorker, n = 16, 25, 3
 	var (
@@ -341,7 +371,7 @@ func TestAllocateConcurrent(t *testing.T) {
 	for range workers {
 		wg.Go(func() {
 			for range perWorker {
-				a, err := s.Allocate(context.Background(), AllocateRequest{IMSI: sub.IMSI, N: n})
+				a, err := s.Allocate(context.Background(), AllocateRequest{IMSI: sub.IMSI, ClientID: client, N: n})
 				if err != nil {
 					t.Error(err)
 					return
@@ -496,8 +526,7 @@ func TestUpdateSubscriber(t *testing.T) {
 
 	// 指定した項目だけを変更する。
 	err := s.UpdateSubscriber(ctx, sub.IMSI, SubscriberPatch{
-		SQN:        new(uint64(0x1000)),
-		AllowPlain: new(true),
+		SQN: new(uint64(0x1000)),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -506,7 +535,7 @@ func TestUpdateSubscriber(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.SQN != 0x1000 || !got.AllowPlain || got.AMF != 0x8000 || got.SQNType != aka.SQNInc32 ||
+	if got.SQN != 0x1000 || got.AMF != 0x8000 || got.SQNType != aka.SQNInc32 ||
 		string(got.Ki) != string(sub.Ki) || !slices.Equal(got.AllowedClientIDs, []int64{c1.ID}) {
 		t.Errorf("after partial update: %+v", got)
 	}
@@ -514,14 +543,13 @@ func TestUpdateSubscriber(t *testing.T) {
 	// 許可クライアントは集合全体を置き換える。空にもできる。
 	inc33 := aka.SQNInc33
 	err = s.UpdateSubscriber(ctx, sub.IMSI, SubscriberPatch{
-		Ki: []byte("KKKKKKKKKKKKKKKK"), OPc: []byte("OOOOOOOOOOOOOOOO"),
 		AMF: new(uint16(0x9001)), SQNType: &inc33, AllowedClientIDs: &[]int64{c2.ID},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, _ = s.GetSubscriber(ctx, sub.IMSI)
-	if string(got.Ki) != "KKKKKKKKKKKKKKKK" || string(got.OPc) != "OOOOOOOOOOOOOOOO" || got.AMF != 0x9001 ||
+	if string(got.Ki) != string(sub.Ki) || got.AMF != 0x9001 ||
 		got.SQNType != aka.SQNInc33 || !slices.Equal(got.AllowedClientIDs, []int64{c2.ID}) || got.SQN != 0x1000 {
 		t.Errorf("after full update: %+v", got)
 	}
@@ -535,12 +563,74 @@ func TestUpdateSubscriber(t *testing.T) {
 	if err := s.UpdateSubscriber(ctx, sub.IMSI, SubscriberPatch{AllowedClientIDs: &[]int64{9999}}); !errors.Is(err, ErrUnknownClient) {
 		t.Errorf("unknown client: err = %v, want ErrUnknownClient", err)
 	}
-	if err := s.UpdateSubscriber(ctx, "440100000000099", SubscriberPatch{AllowPlain: new(true)}); !errors.Is(err, ErrNotFound) {
+	if err := s.UpdateSubscriber(ctx, "440100000000099", SubscriberPatch{SQN: new(uint64(1))}); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unknown subscriber: err = %v, want ErrNotFound", err)
 	}
 	// 存在しない加入者への変更で、キーを作ってしまわない。
 	if _, err := s.GetSubscriber(ctx, "440100000000099"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("update created a subscriber: err = %v", err)
+	}
+	// terminated は変更できない。
+	if _, _, err := s.SetState(ctx, sub.IMSI, StateTerminated); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateSubscriber(ctx, sub.IMSI, SubscriberPatch{SQN: new(uint64(1))}); !errors.Is(err, ErrTerminated) {
+		t.Errorf("terminated: err = %v, want ErrTerminated", err)
+	}
+	if got, _ = s.GetSubscriber(ctx, sub.IMSI); got.SQN != 0x1000 {
+		t.Errorf("terminated subscriber was changed: SQN = %x", got.SQN)
+	}
+}
+
+// TestStateTransitions は状態の移り方の規則（設計概要 §7.1）を確かめる。
+func TestStateTransitions(t *testing.T) {
+	s := openTestStore(t)
+	ctx := t.Context()
+	sub := testSubscriber("440100000000080", aka.SQNInc32)
+	if err := s.CreateSubscriber(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	steps := []struct {
+		name          string
+		to            State
+		reinstate     bool
+		wantFrom      State
+		wantUnchanged bool
+		wantErr       error
+		wantState     State
+	}{
+		{"active to inactive", StateInactive, false, StateActive, false, nil, StateInactive},
+		{"inactive to inactive (unchanged)", StateInactive, false, StateInactive, true, nil, StateInactive},
+		{"inactive to active", StateActive, false, StateInactive, false, nil, StateActive},
+		{"reinstate an active subscriber", "", true, StateActive, false, ErrTransitionNotAllowed, StateActive},
+		{"active to terminated", StateTerminated, false, StateActive, false, nil, StateTerminated},
+		{"terminated to active", StateActive, false, StateTerminated, false, ErrTransitionNotAllowed, StateTerminated},
+		{"terminated to inactive (not by reinstate)", StateInactive, false, StateTerminated, false, ErrTransitionNotAllowed, StateTerminated},
+		{"terminated to terminated (unchanged)", StateTerminated, false, StateTerminated, true, nil, StateTerminated},
+		{"reinstate", "", true, StateTerminated, false, nil, StateInactive},
+	}
+	for _, st := range steps {
+		var from State
+		var unchanged bool
+		var err error
+		if st.reinstate {
+			from, err = s.Reinstate(ctx, sub.IMSI)
+		} else {
+			from, unchanged, err = s.SetState(ctx, sub.IMSI, st.to)
+		}
+		if !errors.Is(err, st.wantErr) || from != st.wantFrom || unchanged != st.wantUnchanged {
+			t.Errorf("%s: from=%q unchanged=%t err=%v, want from=%q unchanged=%t err=%v",
+				st.name, from, unchanged, err, st.wantFrom, st.wantUnchanged, st.wantErr)
+		}
+		if got, _ := s.GetSubscriber(ctx, sub.IMSI); got.State != st.wantState {
+			t.Errorf("%s: state = %q, want %q", st.name, got.State, st.wantState)
+		}
+	}
+	if _, _, err := s.SetState(ctx, "440100000000099", StateInactive); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown subscriber: err = %v, want ErrNotFound", err)
+	}
+	if _, err := s.Reinstate(ctx, "440100000000099"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("reinstate unknown subscriber: err = %v, want ErrNotFound", err)
 	}
 }
 

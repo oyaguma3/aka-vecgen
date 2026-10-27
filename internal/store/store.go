@@ -17,8 +17,18 @@ var (
 	ErrNotFound = errors.New("not found")
 	// ErrExists は同じ IMSI の加入者が既に存在することを表す。
 	ErrExists = errors.New("already exists")
-	// ErrForbidden は払い出しが許可されていないことを表す。
+	// ErrForbidden は、クライアントがその加入者の払い出しを許可されていないことを表す。
 	ErrForbidden = errors.New("forbidden")
+	// ErrClientDisabled は、クライアントが無効にされたか削除されたことを表す。
+	ErrClientDisabled = errors.New("client disabled")
+	// ErrInactive は、加入者が inactive で払い出せないことを表す。
+	ErrInactive = errors.New("subscriber inactive")
+	// ErrTerminated は、加入者が terminated で払い出せない（変更もできない）ことを表す。
+	ErrTerminated = errors.New("subscriber terminated")
+	// ErrActive は、加入者が active で物理削除できないことを表す。
+	ErrActive = errors.New("subscriber active")
+	// ErrTransitionNotAllowed は、状態の移り方の規則で許されない変更であることを表す。
+	ErrTransitionNotAllowed = errors.New("state transition not allowed")
 	// ErrNetworkNameMismatch は要求された Network Name がサーバー側の設定値と一致しないことを表す。
 	ErrNetworkNameMismatch = errors.New("network name mismatch")
 	// ErrCertRegistered は同じ証明書が既に登録されていることを表す。
