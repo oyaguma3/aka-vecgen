@@ -529,6 +529,11 @@ func (h *Handler) reinstateSubscriber(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) getSubscriberKeys(w http.ResponseWriter, r *http.Request) {
+	// 鍵の読み出しは既定で無効（VECGEN_KEY_EXPORT=true のときだけ。設計概要 §8.4）
+	if !h.KeyExport {
+		newProblem(http.StatusNotFound, causeKeyExportDisabled, "key export is disabled (VECGEN_KEY_EXPORT)").write(w)
+		return
+	}
 	sub, ok := h.loadSubscriber(w, r)
 	if !ok {
 		return
@@ -542,4 +547,69 @@ func (h *Handler) getSubscriberKeys(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, subscriberKeysJSON{Ki: hex.EncodeToString(ki), OPc: hex.EncodeToString(opc)})
 	clear(ki)
 	clear(opc)
+}
+
+// maxBatchGet は一括取得で受け付ける IMSI の数の上限（設計概要 §6.2）。
+const maxBatchGet = 500
+
+type batchGetJSON struct {
+	IMSIs *[]string `json:"imsis"`
+}
+
+type batchGetResultJSON struct {
+	Items    []subscriberJSON `json:"items"`
+	NotFound []string         `json:"notFound"`
+}
+
+// batchGetSubscribers は IMSI を 500 件まで受け取り、ある加入者（鍵を除く）と、ない IMSI を返す（設計概要 §6.2）。
+// 台帳との突き合わせと一括投入の前の確認に使う。重なった IMSI は 1 つにまとめ、応答は要求の順にする。
+func (h *Handler) batchGetSubscribers(w http.ResponseWriter, r *http.Request) {
+	var body batchGetJSON
+	if p := decodeBody(w, r, &body); p != nil {
+		p.write(w)
+		return
+	}
+	switch {
+	case body.IMSIs == nil:
+		badParams(causeMandatoryIEMissing, invalidParam{"imsis", "is required"}).write(w)
+		return
+	case len(*body.IMSIs) == 0 || len(*body.IMSIs) > maxBatchGet:
+		badParams(causeMandatoryIEIncorrect, invalidParam{"imsis", fmt.Sprintf("must have 1 to %d items", maxBatchGet)}).write(w)
+		return
+	}
+	var imsis []string
+	seen := map[string]bool{}
+	for i, imsi := range *body.IMSIs {
+		if !imsiPattern.MatchString(imsi) {
+			badParams(causeMandatoryIEIncorrect, invalidParam{fmt.Sprintf("imsis[%d]", i), "must be 5 to 15 digits"}).write(w)
+			return
+		}
+		if !seen[imsi] {
+			seen[imsi] = true
+			imsis = append(imsis, imsi)
+		}
+	}
+	subs, err := h.Store.GetSubscribers(r.Context(), imsis)
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	clientIDs, err := h.Store.ClientIDs(r.Context())
+	if err != nil {
+		h.internalError(w, r, err)
+		return
+	}
+	found := map[string]store.Subscriber{}
+	for _, sub := range subs {
+		found[sub.IMSI] = sub
+	}
+	out := batchGetResultJSON{Items: []subscriberJSON{}, NotFound: []string{}}
+	for _, imsi := range imsis {
+		if sub, ok := found[imsi]; ok {
+			out.Items = append(out.Items, toSubscriberJSON(sub, clientIDs))
+		} else {
+			out.NotFound = append(out.NotFound, imsi)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }

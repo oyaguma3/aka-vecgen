@@ -803,7 +803,7 @@ func TestAudit(t *testing.T) {
 	}
 	for i := range 5 {
 		e := AuditEntry{Operator: "alice", MgmtClient: "bff", Action: "subscriber.create", Target: fmt.Sprint(i), Detail: `{"n":1}`, TraceID: "t" + fmt.Sprint(i)}
-		if err := s.AppendAudit(ctx, e, 1000); err != nil {
+		if _, err := s.AppendAudit(ctx, e, 1000); err != nil {
 			t.Fatal(err)
 		}
 	}

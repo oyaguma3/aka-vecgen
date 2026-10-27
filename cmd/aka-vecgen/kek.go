@@ -41,6 +41,7 @@ func rotateKEKCommand(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("rotate-kek", flag.ExitOnError)
 	oldFile := fs.String("old", "", "今の KEK のファイル")
 	newFile := fs.String("new", "", "新しい KEK のファイル")
+	operator := operatorFlag(fs)
 	fs.Parse(args)
 	if *oldFile == "" || *newFile == "" {
 		return fmt.Errorf("-old and -new are required")
@@ -73,6 +74,9 @@ func rotateKEKCommand(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("rotate-kek %s -> %s: %w", oldK.ID(), newK.ID(), err)
 	}
+	newCLIAudit(cfg, st, *operator).record(ctx, "kek.rotate", "kek", map[string]any{
+		"from": oldK.ID(), "to": newK.ID(), "rotated": res.Rotated, "alreadyNew": res.AlreadyNew, "invalid": res.Invalid, "serverCertificates": res.Certificates,
+	})
 	fmt.Printf("kek rotated %s -> %s in %s: subscribers rotated=%d already-new=%d invalid=%d, server certificates=%d\n",
 		oldK.ID(), newK.ID(), time.Since(start).Round(time.Millisecond), res.Rotated, res.AlreadyNew, res.Invalid, res.Certificates)
 	if res.Invalid > 0 {

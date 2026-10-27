@@ -86,6 +86,9 @@ jobs:
           mkdir -p secrets && chmod 700 secrets
           openssl rand -hex 32 > secrets/kek
           sudo chown 65532 secrets/kek && sudo chmod 600 secrets/kek
+          touch secrets/admin-clients
+          sudo chown 65532 secrets/admin-clients && sudo chmod 600 secrets/admin-clients
+          mkdir -p audit && sudo chown 65532 audit && sudo chmod 750 audit
           # aka-vecgen と Valkey が healthy になるまで待つ（compose の healthcheck の確認を兼ねる）。
           docker compose up -d --build --wait --wait-timeout 120
       - name: クライアントと加入者の登録
@@ -113,10 +116,23 @@ jobs:
           check "$(get eap-aka EAP_AKA 1)" 1 ck ik
           check "$(get umts-aka UMTS_AKA 3)" 3 ck ik
           check "$(get eap-aka-prime EAP_AKA_PRIME 1)" 1 ckPrime ikPrime
+      - name: SIGHUP での読み直しと監査ログのファイル
+        run: |
+          # AV 用のサーバー証明書を作り直し、SIGHUP で動いているサーバーに反映する（README の「コマンド」）
+          docker compose exec -T aka-vecgen /aka-vecgen av-cert reset -operator ci > server-new.pem
+          docker compose kill -s HUP aka-vecgen
+          sleep 1
+          curl -sS --fail-with-body --retry 5 --retry-delay 1 --retry-all-errors --cacert server-new.pem --cert radius.pem -X POST \
+            https://localhost:8443/nudm-ueau/v1/imsi-440100123456789/hss-security-information/eap-aka/generate-av \
+            -d '{"hssAuthType":"EAP_AKA","numOfRequestedVectors":1}' | jq -e '.hssAuthenticationVectors | length == 1'
+          docker compose logs --no-color aka-vecgen | grep -q '"event_id":"SERVER_CERT_RELOADED"'
+          # コマンドの操作が監査ログのファイルに残る
+          sudo cat audit/audit-*.jsonl | jq -s -e 'map(.action) | index("client.create") != null and index("subscriber.create") != null and index("av-server-certificate.reset") != null and index("reload") != null'
       - name: 登録したクライアント以外は接続できないこと
         run: |
           openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 -subj /CN=stranger -keyout stranger-key.pem -out stranger.pem 2>/dev/null
-          if curl -sS --cacert server.pem --cert stranger.pem --key stranger-key.pem -X POST \
+          # サーバー証明書は前の手順で作り直したもの（server-new.pem）で確かめる（拒否の理由がサーバーの検証の失敗にならないように）
+          if curl -sS --cacert server-new.pem --cert stranger.pem --key stranger-key.pem -X POST \
               https://localhost:8443/nudm-ueau/v1/imsi-440100123456789/hss-security-information/eap-aka/generate-av \
               -d '{"hssAuthType":"EAP_AKA","numOfRequestedVectors":1}'; then
             echo "未登録のクライアントが接続できてしまいました"
@@ -166,6 +182,7 @@ jobs:
         run: |
           "$RUNNER_TEMP/aka-vecgen" gen-kek -out kek
           echo "VECGEN_KEK_FILE=$RUNNER_TEMP/kek" >> "$GITHUB_ENV"
+          echo "VECGEN_AUDIT_DIR=$RUNNER_TEMP/audit" >> "$GITHUB_ENV"
       - name: 試験用のクライアントと加入者の投入
         working-directory: ${{ runner.temp }}
         run: sh "$GITHUB_WORKSPACE/aka-mvpset/conformance/av-api/fixtures/aka-vecgen.sh" out ./av-conformance ./aka-vecgen

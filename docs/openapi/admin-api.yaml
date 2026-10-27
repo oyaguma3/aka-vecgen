@@ -1,9 +1,9 @@
 openapi: 3.0.3
 info:
   title: aka-vecgen 管理API
-  version: 2.0.0-draft
+  version: 2.0.0
   description: |
-    加入者、AVクライアント、AV用サーバー証明書、ログを操作する API。
+    加入者を操作し、AVクライアント・AV用サーバー証明書・監査ログを読み出す API。
     MVP セットでは、管理クライアントは aka-provisioner だけ（設計概要 §1）。
 
     2.0.0-draft（MVP セットの段階 2-1）:
@@ -13,16 +13,25 @@ info:
       `active` は物理削除できず、`terminated` は変更できない（設計概要 §7）。
     - 平文HTTP をなくしたので、加入者の `allowPlain` と状態の `avPlainEnabled` を外した。
     - 登録の後に鍵（Ki・OPc）を変える口をなくした（変更の本文に `ki`・`opc` があれば 400）。
-    - 一括取得、鍵の口の既定の無効、AVクライアントとサーバー証明書の書き込みの口の廃止、`/logs` の廃止は、段階 2-3 で行う。
+
+    2.0.0（MVP セットの段階 2-3）:
+    - 加入者の一括取得 `POST /subscribers/batch-get` を足した（IMSI を 500 件まで。鍵は返さない）。
+    - 鍵の読み出し `GET /subscribers/{imsi}/keys` は既定で無効にした（サーバーの `VECGEN_KEY_EXPORT=true` のときだけ。無効なら 404 `KEY_EXPORT_DISABLED`）。
+    - AVクライアントと AV用サーバー証明書の書き込みの口（登録・変更・削除・証明書の差し替え）をなくした。
+      ノードの上のコマンド（`aka-vecgen client ...`、`aka-vecgen av-cert ...`）で行い、この API は読み出しだけ（設計概要 §9.3）。
+    - メモリーの中のログの口 `/logs` をなくした（ログはノードのログの仕組みで取りに行く）。
+    - `/status` に、契約の版、管理用のサーバー証明書の期限、管理クライアントの識別名と読み込んだ日時を足した。
 
     認証:
     - 認証ベクターAPI とは別のポート、別のサーバー証明書で提供する。
-    - mTLS 必須。サーバー側に静的設定された管理クライアントの証明書だけを受け付ける。
+    - mTLS 必須。サーバーのピンのファイル（1 行に 識別名=フィンガープリント）の管理クライアントの証明書だけを受け付ける。
+      ピンのファイルは SIGHUP で読み直す（再起動しない）。同じ識別名に新旧 2 つの証明書を書ける。
       証明書なし、または未登録の証明書による接続は TLS ハンドシェイクで拒否する。
     - 管理クライアントは全権として扱う。ユーザーや権限の概念はこの API にはない。
 
     監査ログ:
-    - 変更操作と Ki / OPc の取得は監査ログに記録する。
+    - 変更操作と Ki / OPc の取得は監査ログに記録する（Valkey の Stream と、ノードの日ごとのファイル）。
+      コマンドの操作（操作者は `-operator`、管理クライアントは `cli`）、KEK の入れ替え、SIGHUP での読み直しも同じ監査ログに残る。
     - 管理クライアントは `X-Operator-Id` ヘッダーで操作者 ID を渡す。
       省略した場合、監査ログには管理クライアントの識別名だけが残る。
 
@@ -55,7 +64,7 @@ tags:
   - name: av-server-certificate
     description: 認証ベクターAPI 用のサーバー証明書
   - name: logs
-    description: サーバーログと監査ログ
+    description: 監査ログ
 
 paths:
   /status:
@@ -317,6 +326,35 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /subscribers/batch-get:
+    parameters:
+      - $ref: '#/components/parameters/OperatorId'
+      - $ref: '#/components/parameters/TraceId'
+    post:
+      tags: [subscribers]
+      summary: 加入者を一括で取得する
+      operationId: batchGetSubscribers
+      description: |
+        IMSI を 1〜500 件受け取り、ある加入者（鍵を除く）と、ない IMSI を返す（設計概要 §6.2）。
+        重なった IMSI は 1 つにまとめ、どちらも要求の順に返す。台帳との突き合わせと一括投入の前の確かめに使う。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchGetRequest'
+      responses:
+        '200':
+          description: ある加入者と、ない IMSI
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchGetResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /subscribers/{imsi}/keys:
     parameters:
       - $ref: '#/components/parameters/Imsi'
@@ -326,7 +364,9 @@ paths:
       tags: [subscribers]
       summary: 加入者の Ki と OPc を取得する
       operationId: getSubscriberKeys
-      description: この操作は監査ログに記録する。
+      description: |
+        既定で無効。サーバーの `VECGEN_KEY_EXPORT=true` のときだけ使える（別の生成源への移し替えのような、まれな作業のため。設計概要 §8.4）。
+        この操作は監査ログに記録する。
       responses:
         '200':
           description: Ki と OPc
@@ -335,7 +375,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/SubscriberKeys'
         '404':
-          $ref: '#/components/responses/SubscriberNotFound'
+          description: |
+            加入者が存在しない（`cause` は `USER_NOT_FOUND`）、または鍵の読み出しが無効（`cause` は `KEY_EXPORT_DISABLED`）。
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -355,35 +400,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ClientList'
-        '500':
-          $ref: '#/components/responses/InternalError'
-    post:
-      tags: [clients]
-      summary: AVクライアントを登録する
-      operationId: createClient
-      description: クライアント証明書を登録し、クライアントID を発番する。ID は削除後も再利用しない。
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ClientCreate'
-      responses:
-        '201':
-          description: 登録した AVクライアント
-          headers:
-            Location:
-              description: 登録した AVクライアントの URI
-              schema:
-                type: string
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Client'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '409':
-          $ref: '#/components/responses/CertAlreadyRegistered'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -407,81 +423,7 @@ paths:
           $ref: '#/components/responses/ClientNotFound'
         '500':
           $ref: '#/components/responses/InternalError'
-    patch:
-      tags: [clients]
-      summary: AVクライアントを変更する
-      operationId: updateClient
-      description: |
-        指定した項目だけを変更する（JSON Merge Patch）。変更は即時に反映する。
-        証明書の差し替えは `PUT /clients/{clientId}/certificate` で行う。
-      requestBody:
-        required: true
-        content:
-          application/merge-patch+json:
-            schema:
-              $ref: '#/components/schemas/ClientUpdate'
-      responses:
-        '200':
-          description: 変更後の AVクライアント
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Client'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '404':
-          $ref: '#/components/responses/ClientNotFound'
-        '500':
-          $ref: '#/components/responses/InternalError'
-    delete:
-      tags: [clients]
-      summary: AVクライアントを削除する
-      operationId: deleteClient
-      description: |
-        削除した時点で、そのクライアントは接続できなくなる。
-        各加入者の許可クライアントからの除去は、応答を返した後にサーバーが行う。
-      responses:
-        '204':
-          description: 削除した
-        '404':
-          $ref: '#/components/responses/ClientNotFound'
-        '500':
-          $ref: '#/components/responses/InternalError'
 
-  /clients/{clientId}/certificate:
-    parameters:
-      - $ref: '#/components/parameters/ClientId'
-      - $ref: '#/components/parameters/OperatorId'
-      - $ref: '#/components/parameters/TraceId'
-    put:
-      tags: [clients]
-      summary: AVクライアントの証明書を差し替える
-      operationId: replaceClientCertificate
-      description: |
-        クライアントID を変えずに証明書だけを差し替える。証明書の更新時に使う。
-        各加入者の許可クライアントの設定はそのまま引き継がれる。
-        差し替えた時点で、古い証明書では接続できなくなる。
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ClientCertificateReplace'
-      responses:
-        '200':
-          description: 差し替え後の AVクライアント
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Client'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '404':
-          $ref: '#/components/responses/ClientNotFound'
-        '409':
-          $ref: '#/components/responses/CertAlreadyRegistered'
-        '500':
-          $ref: '#/components/responses/InternalError'
 
   /av-server-certificate:
     parameters:
@@ -501,82 +443,7 @@ paths:
                 $ref: '#/components/schemas/ServerCertificate'
         '500':
           $ref: '#/components/responses/InternalError'
-    put:
-      tags: [av-server-certificate]
-      summary: AV用サーバー証明書を登録する
-      operationId: replaceAvServerCertificate
-      description: 持ち込みの証明書と秘密鍵に差し替える。再起動なしで、以後の新しい接続から反映する。
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ServerCertificateReplace'
-      responses:
-        '200':
-          description: 差し替え後のサーバー証明書
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ServerCertificate'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '500':
-          $ref: '#/components/responses/InternalError'
-    delete:
-      tags: [av-server-certificate]
-      summary: AV用サーバー証明書を削除する
-      operationId: resetAvServerCertificate
-      description: 登録済みの証明書を捨て、自己署名証明書を再生成して置き換える。証明書のない状態にはならない。
-      responses:
-        '200':
-          description: 再生成した自己署名証明書
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ServerCertificate'
-        '500':
-          $ref: '#/components/responses/InternalError'
 
-  /logs:
-    parameters:
-      - $ref: '#/components/parameters/TraceId'
-    get:
-      tags: [logs]
-      summary: 直近のサーバーログを取得する
-      operationId: listLogs
-      description: |
-        メモリ上のバッファに残っているログを、古い順に返す。
-        `after` を指定すると、その番号より後のログだけを返す。続きを取得するには、応答の `lastSeq` を次の `after` に渡す。
-
-        バッファはサーバーの再起動で消え、番号も振り直される。
-        応答の `bootId` が前回と変わっていたら、`after` を外して取得し直す。
-      parameters:
-        - name: after
-          in: query
-          description: この番号より後のログを返す。省略時は最新の `limit` 件を返す。
-          schema:
-            type: integer
-            format: int64
-            minimum: 0
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 1000
-            default: 200
-      responses:
-        '200':
-          description: サーバーログ
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/LogList'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '500':
-          $ref: '#/components/responses/InternalError'
 
   /audit-logs:
     parameters:
@@ -654,7 +521,6 @@ components:
         - `MANDATORY_IE_INCORRECT`: 必須項目の値が不正
         - `OPTIONAL_IE_INCORRECT`: 任意項目の値が不正
         - `CLIENT_NOT_FOUND`: `allowedClientIds` に存在しないクライアントID がある
-        - `INVALID_CERTIFICATE`: 証明書または秘密鍵を解釈できない、有効期限が切れている、秘密鍵が証明書と対応していない
       content:
         application/problem+json:
           schema:
@@ -667,12 +533,6 @@ components:
             $ref: '#/components/schemas/ProblemDetails'
     ClientNotFound:
       description: AVクライアントが存在しない。`cause` は `CLIENT_NOT_FOUND`。
-      content:
-        application/problem+json:
-          schema:
-            $ref: '#/components/schemas/ProblemDetails'
-    CertAlreadyRegistered:
-      description: 同じ証明書が既に別の AVクライアントに登録されている。`cause` は `CERT_ALREADY_REGISTERED`。
       content:
         application/problem+json:
           schema:
@@ -858,6 +718,30 @@ components:
         opc:
           $ref: '#/components/schemas/Hex128'
 
+    BatchGetRequest:
+      type: object
+      required: [imsis]
+      properties:
+        imsis:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/Imsi'
+
+    BatchGetResult:
+      type: object
+      required: [items, notFound]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Subscriber'
+        notFound:
+          type: array
+          items:
+            $ref: '#/components/schemas/Imsi'
+
     SubscriberList:
       type: object
       required:
@@ -931,47 +815,8 @@ components:
           type: string
           format: date-time
 
-    ClientCreate:
-      type: object
-      required:
-        - name
-        - certPem
-      properties:
-        name:
-          type: string
-          minLength: 1
-          maxLength: 64
-        certPem:
-          $ref: '#/components/schemas/CertPem'
-        enabled:
-          type: boolean
-          default: true
-        networkName:
-          allOf:
-            - $ref: '#/components/schemas/NetworkName'
-          default: ''
 
-    ClientUpdate:
-      type: object
-      description: 変更する項目だけを指定する。`null` は指定できない。
-      minProperties: 1
-      properties:
-        name:
-          type: string
-          minLength: 1
-          maxLength: 64
-        enabled:
-          type: boolean
-        networkName:
-          $ref: '#/components/schemas/NetworkName'
 
-    ClientCertificateReplace:
-      type: object
-      required:
-        - certPem
-      properties:
-        certPem:
-          $ref: '#/components/schemas/CertPem'
 
     ClientList:
       type: object
@@ -1017,19 +862,6 @@ components:
           type: string
           format: date-time
 
-    ServerCertificateReplace:
-      type: object
-      required:
-        - certPem
-        - keyPem
-      properties:
-        certPem:
-          allOf:
-            - $ref: '#/components/schemas/CertPem'
-          description: PEM 形式のサーバー証明書。中間証明書を続けて含めてよい。
-        keyPem:
-          type: string
-          description: PEM 形式の秘密鍵。暗号化されていないもの。
 
     Status:
       type: object
@@ -1039,18 +871,26 @@ components:
         - startedAt
         - subscriberCount
         - clientCount
+        - avApiContractVersion
         - avServerCertificateNotAfter
+        - adminServerCertificateNotAfter
         - kekId
+        - adminClients
+        - adminClientsLoadedAt
       properties:
         version:
           type: string
           description: aka-vecgen のバージョン。
         bootId:
           type: string
-          description: 起動ごとに変わる識別子。`/logs` の `bootId` と同じ値。
+          description: 起動ごとに変わる識別子。
         startedAt:
           type: string
           format: date-time
+        avApiContractVersion:
+          type: string
+          description: 合わせている認証ベクターAPI の契約の版（aka-mvpset の docs/av-api-contract.md）。
+          example: 1.0.0
         subscriberCount:
           type: integer
         clientCount:
@@ -1059,58 +899,25 @@ components:
           type: string
           format: date-time
           description: AV用サーバー証明書の有効期限。
+        adminServerCertificateNotAfter:
+          type: string
+          format: date-time
+          description: 管理API 用サーバー証明書の有効期限。
+        adminClients:
+          type: array
+          items:
+            type: string
+          description: ピンのファイルの管理クライアントの識別名（重ねず、辞書順）。
+        adminClientsLoadedAt:
+          type: string
+          format: date-time
+          description: ピンのファイルを読み込んだ日時（起動と SIGHUP）。
         kekId:
           type: string
           pattern: '^[0-9a-f]{16}$'
           description: 加入者の鍵とサーバー証明書の秘密鍵を暗号化している KEK の識別子（SHA-256 の先頭 8 バイトの 16 進）。
 
-    LogEntry:
-      type: object
-      required:
-        - seq
-        - time
-        - level
-        - msg
-      properties:
-        seq:
-          type: integer
-          format: int64
-          description: 起動からの通し番号。
-        time:
-          type: string
-          format: date-time
-        level:
-          type: string
-          enum:
-            - DEBUG
-            - INFO
-            - WARN
-            - ERROR
-        msg:
-          type: string
-        attrs:
-          type: object
-          description: ログの属性。
-          additionalProperties: true
 
-    LogList:
-      type: object
-      required:
-        - bootId
-        - items
-        - lastSeq
-      properties:
-        bootId:
-          type: string
-          description: 起動ごとに変わる識別子。
-        items:
-          type: array
-          items:
-            $ref: '#/components/schemas/LogEntry'
-        lastSeq:
-          type: integer
-          format: int64
-          description: 返した最後のログの番号。返すログがなければ、指定された `after` の値（省略時は 0）。
 
     AuditAction:
       type: string
@@ -1127,6 +934,9 @@ components:
         - client.delete
         - av-server-certificate.replace
         - av-server-certificate.reset
+        - admin-server-certificate.reset
+        - kek.rotate
+        - reload
 
     AuditLogEntry:
       type: object

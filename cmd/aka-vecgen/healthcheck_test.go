@@ -2,6 +2,8 @@ package main
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
@@ -9,13 +11,16 @@ import (
 )
 
 func TestListenerAddrs(t *testing.T) {
-	base := config.Config{AVTLSAddr: ":8443", AdminAddr: ":9443"}
+	pins := filepath.Join(t.TempDir(), "admin-clients")
+	base := config.Config{AVTLSAddr: ":8443", AdminAddr: ":9443", AdminClientsFile: pins}
 	if got := listenerAddrs(base); !slices.Equal(got, []string{":8443"}) {
 		t.Errorf("AV only: %v", got)
 	}
-	all := base
-	all.AdminClients = map[string]string{"00": "bff"}
-	if got := listenerAddrs(all); !slices.Equal(got, []string{":8443", ":9443"}) {
+	// ピンのファイルがあれば（空でも）管理API も待ち受ける
+	if err := os.WriteFile(pins, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := listenerAddrs(base); !slices.Equal(got, []string{":8443", ":9443"}) {
 		t.Errorf("all listeners: %v", got)
 	}
 }

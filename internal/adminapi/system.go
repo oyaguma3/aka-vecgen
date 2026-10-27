@@ -2,28 +2,35 @@ package adminapi
 
 import (
 	"encoding/json/jsontext"
-	"errors"
 	"net/http"
 	"regexp"
 	"time"
 
 	"github.com/oyaguma3/aka-vecgen/internal/certs"
-	"github.com/oyaguma3/aka-vecgen/internal/logbuf"
 	"github.com/oyaguma3/aka-vecgen/internal/store"
 )
 
 // ---- 状態 ----
 
 type statusJSON struct {
-	Version                     string    `json:"version"`
-	BootID                      string    `json:"bootId"`
-	StartedAt                   time.Time `json:"startedAt"`
-	SubscriberCount             int64     `json:"subscriberCount"`
-	ClientCount                 int64     `json:"clientCount"`
-	AVServerCertificateNotAfter time.Time `json:"avServerCertificateNotAfter"`
+	Version   string    `json:"version"`
+	BootID    string    `json:"bootId"`
+	StartedAt time.Time `json:"startedAt"`
+	// AVAPIContractVersion は、合わせている認証ベクターAPI の契約の版（aka-mvpset の docs/av-api-contract.md §13）。
+	AVAPIContractVersion           string    `json:"avApiContractVersion"`
+	SubscriberCount                int64     `json:"subscriberCount"`
+	ClientCount                    int64     `json:"clientCount"`
+	AVServerCertificateNotAfter    time.Time `json:"avServerCertificateNotAfter"`
+	AdminServerCertificateNotAfter time.Time `json:"adminServerCertificateNotAfter"`
 	// KEKID は使っている KEK の識別子（SHA-256 の先頭 8 バイトの 16 進。設計概要 §8.1）。
 	KEKID string `json:"kekId"`
+	// AdminClients は管理クライアントの識別名、AdminClientsLoadedAt はピンのファイルを読み込んだ日時（SIGHUP で読み直す）。
+	AdminClients         []string  `json:"adminClients"`
+	AdminClientsLoadedAt time.Time `json:"adminClientsLoadedAt"`
 }
+
+// AVAPIContractVersion は、合わせている認証ベクターAPI の契約の版。
+const AVAPIContractVersion = "1.0.0"
 
 func (h *Handler) getStatus(w http.ResponseWriter, r *http.Request) {
 	subs, err := h.Store.CountSubscribers(r.Context())
@@ -36,24 +43,23 @@ func (h *Handler) getStatus(w http.ResponseWriter, r *http.Request) {
 		h.internalError(w, r, err)
 		return
 	}
-	sc, err := h.Certs.AVCertificate(r.Context())
-	if err != nil {
-		h.internalError(w, r, err)
-		return
-	}
-	cert, err := certs.ParsePEM(sc.CertPEM)
-	if err != nil {
-		h.internalError(w, r, err)
-		return
+	avNotAfter, adminNotAfter := h.Server.CertificateNotAfter()
+	names, loadedAt := h.Server.AdminClients()
+	if names == nil {
+		names = []string{}
 	}
 	writeJSON(w, http.StatusOK, statusJSON{
-		Version:                     h.Version,
-		BootID:                      h.BootID,
-		StartedAt:                   h.StartedAt,
-		SubscriberCount:             subs,
-		ClientCount:                 clients,
-		AVServerCertificateNotAfter: cert.NotAfter.UTC(),
-		KEKID:                       h.Store.KEKID(),
+		Version:                        h.Version,
+		BootID:                         h.BootID,
+		StartedAt:                      h.StartedAt,
+		AVAPIContractVersion:           AVAPIContractVersion,
+		SubscriberCount:                subs,
+		ClientCount:                    clients,
+		AVServerCertificateNotAfter:    avNotAfter.UTC(),
+		AdminServerCertificateNotAfter: adminNotAfter.UTC(),
+		KEKID:                          h.Store.KEKID(),
+		AdminClients:                   names,
+		AdminClientsLoadedAt:           loadedAt,
 	})
 }
 
@@ -69,12 +75,6 @@ type serverCertificateJSON struct {
 	UpdatedAt         time.Time `json:"updatedAt"`
 }
 
-type serverCertificateReplaceJSON struct {
-	CertPEM *string `json:"certPem"`
-	KeyPEM  *string `json:"keyPem"`
-}
-
-// writeServerCertificate はサーバー証明書の情報を書き込む。秘密鍵は返さない。
 func (h *Handler) writeServerCertificate(w http.ResponseWriter, r *http.Request, sc store.ServerCertificate) {
 	cert, err := certs.ParsePEM(sc.CertPEM)
 	if err != nil {
@@ -93,7 +93,7 @@ func (h *Handler) writeServerCertificate(w http.ResponseWriter, r *http.Request,
 }
 
 func (h *Handler) getAVServerCertificate(w http.ResponseWriter, r *http.Request) {
-	sc, err := h.Certs.AVCertificate(r.Context())
+	sc, err := h.Server.AVCertificate(r.Context())
 	if err != nil {
 		h.internalError(w, r, err)
 		return
@@ -108,105 +108,6 @@ func certFingerprint(pem []byte) string {
 		return ""
 	}
 	return certs.Fingerprint(cert)
-}
-
-func (h *Handler) replaceAVServerCertificate(w http.ResponseWriter, r *http.Request) {
-	var body serverCertificateReplaceJSON
-	if p := decodeBody(w, r, &body); p != nil {
-		p.write(w)
-		return
-	}
-	var v validation
-	if body.CertPEM == nil {
-		v.missing = append(v.missing, invalidParam{"certPem", "is required"})
-	}
-	if body.KeyPEM == nil {
-		v.missing = append(v.missing, invalidParam{"keyPem", "is required"})
-	}
-	if p := v.problem(); p != nil {
-		p.write(w)
-		return
-	}
-
-	before, err := h.Certs.AVCertificate(r.Context())
-	if err != nil {
-		h.internalError(w, r, err)
-		return
-	}
-	sc, err := h.Certs.ReplaceAVCertificate(r.Context(), []byte(*body.CertPEM), []byte(*body.KeyPEM))
-	if errors.Is(err, certs.ErrInvalid) {
-		newProblem(http.StatusBadRequest, causeInvalidCertificate, err.Error()).write(w)
-		return
-	}
-	if err != nil {
-		h.internalError(w, r, err)
-		return
-	}
-	h.audit(r, "av-server-certificate.replace", "av-server-certificate", map[string]any{
-		"fingerprintSha256": change{certFingerprint(before.CertPEM), certFingerprint(sc.CertPEM)},
-	})
-	h.writeServerCertificate(w, r, sc)
-}
-
-func (h *Handler) resetAVServerCertificate(w http.ResponseWriter, r *http.Request) {
-	before, err := h.Certs.AVCertificate(r.Context())
-	if err != nil {
-		h.internalError(w, r, err)
-		return
-	}
-	sc, err := h.Certs.ResetAVCertificate(r.Context())
-	if err != nil {
-		h.internalError(w, r, err)
-		return
-	}
-	h.audit(r, "av-server-certificate.reset", "av-server-certificate", map[string]any{
-		"fingerprintSha256": change{certFingerprint(before.CertPEM), certFingerprint(sc.CertPEM)},
-	})
-	h.writeServerCertificate(w, r, sc)
-}
-
-// ---- ログ ----
-
-type logEntryJSON struct {
-	Seq   int64          `json:"seq"`
-	Time  time.Time      `json:"time"`
-	Level string         `json:"level"`
-	Msg   string         `json:"msg"`
-	Attrs map[string]any `json:"attrs,omitempty"`
-}
-
-type logListJSON struct {
-	BootID  string         `json:"bootId"`
-	Items   []logEntryJSON `json:"items"`
-	LastSeq int64          `json:"lastSeq"`
-}
-
-func (h *Handler) listLogs(w http.ResponseWriter, r *http.Request) {
-	limit, p := queryInt(r, "limit", 200, 1, 1000)
-	if p != nil {
-		p.write(w)
-		return
-	}
-	var entries []logbuf.Entry
-	out := logListJSON{BootID: h.BootID}
-	if r.URL.Query().Has("after") {
-		after, p := queryInt(r, "after", 0, 0, 1<<62)
-		if p != nil {
-			p.write(w)
-			return
-		}
-		entries = h.Logs.After(after, int(limit))
-		out.LastSeq = after
-	} else {
-		entries = h.Logs.Latest(int(limit))
-	}
-
-	out.Items = make([]logEntryJSON, len(entries))
-	for i, e := range entries {
-		out.Items[i] = logEntryJSON{Seq: e.Seq, Time: e.Time, Level: e.Level, Msg: e.Msg, Attrs: e.Attrs}
-		out.LastSeq = e.Seq
-	}
-	writeJSON(w, http.StatusOK, out)
 }
 
 // ---- 監査ログ ----

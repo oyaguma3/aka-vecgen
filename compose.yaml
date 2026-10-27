@@ -20,8 +20,11 @@ services:
       start_period: 15s
     # KEK（加入者の鍵とサーバー証明書の秘密鍵を暗号化する鍵。設計概要 §8）。Valkey とは別のファイルで渡す。
     # コンテナは UID 65532 で動くので、この UID で読めるようにする（README の「起動」）。
+    # 管理クライアントのピン（1 行に 識別名=フィンガープリント。設計概要 §10.1）。空でもよい。
+    # 書き換えたら docker compose kill -s HUP aka-vecgen で読み直す（サーバー証明書の差し替えも同じ合図で反映する）。
     secrets:
       - kek
+      - admin-clients
     environment:
       VECGEN_VALKEY_ADDR: valkey:6379
       VECGEN_VALKEY_PASSWORD: ${VALKEY_PASSWORD:?.env に VALKEY_PASSWORD を設定してください}
@@ -29,11 +32,18 @@ services:
       VECGEN_AV_TLS_ADDR: ":8443"
       VECGEN_AV_TLS_HOSTS: ${VECGEN_AV_TLS_HOSTS:-localhost,127.0.0.1,aka-vecgen}
       VECGEN_ADMIN_ADDR: ":9443"
-      VECGEN_ADMIN_CLIENTS: ${VECGEN_ADMIN_CLIENTS:-}
+      VECGEN_ADMIN_CLIENTS_FILE: /run/secrets/admin-clients
       VECGEN_ADMIN_TLS_HOSTS: ${VECGEN_ADMIN_TLS_HOSTS:-localhost,127.0.0.1,aka-vecgen}
       VECGEN_LOG_LEVEL: ${VECGEN_LOG_LEVEL:-info}
-      VECGEN_LOG_BUFFER: ${VECGEN_LOG_BUFFER:-1000}
-      VECGEN_AUDIT_MAX: ${VECGEN_AUDIT_MAX:-10000}
+      VECGEN_AUDIT_MAX: ${VECGEN_AUDIT_MAX:-100000}
+      VECGEN_AUDIT_DIR: /data/audit
+      VECGEN_AUDIT_RETENTION_DAYS: ${VECGEN_AUDIT_RETENTION_DAYS:-14}
+      # 鍵の読み出しの口（GET /admin/v2/subscribers/{imsi}/keys）。別の生成源への移し替えのときだけ true にする。
+      VECGEN_KEY_EXPORT: ${VECGEN_KEY_EXPORT:-false}
+    volumes:
+      # 監査ログの日ごとのファイル（audit-YYYYMMDD.jsonl。設計概要 §13.2）。監視用の PC が取りに行く。
+      # コンテナは UID 65532 で動くので、この UID で書けるようにする（README の「起動」）。
+      - ./audit:/data/audit
     ports:
       # Docker が公開したポートは ufw の規則を通らない。公開範囲はここのバインド先で制御する。
       - "${VECGEN_AV_TLS_PUBLISH:-0.0.0.0:8443}:8443"
@@ -62,6 +72,8 @@ services:
 secrets:
   kek:
     file: ./secrets/kek
+  admin-clients:
+    file: ./secrets/admin-clients
 
 networks:
   # 同一ホスト上の別の compose プロジェクト（AKA-RADIUS サーバーや BFF など）が接続するためのネットワーク。

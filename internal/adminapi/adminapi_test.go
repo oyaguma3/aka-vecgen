@@ -9,19 +9,21 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
 
 	"github.com/oyaguma3/aka-vecgen/internal/adminapi"
+	"github.com/oyaguma3/aka-vecgen/internal/audit"
 	"github.com/oyaguma3/aka-vecgen/internal/certs"
 	"github.com/oyaguma3/aka-vecgen/internal/config"
 	"github.com/oyaguma3/aka-vecgen/internal/kek"
-	"github.com/oyaguma3/aka-vecgen/internal/logbuf"
 	"github.com/oyaguma3/aka-vecgen/internal/server"
 	"github.com/oyaguma3/aka-vecgen/internal/store"
 )
@@ -40,9 +42,46 @@ type env struct {
 	h     http.Handler
 	store *store.Store
 	log   *slog.Logger
+	// logs はログの出力（JSON の行）。auditDir は監査ログのファイルの置き場所。
+	logs     *syncBuffer
+	auditDir string
 }
 
-func newEnv(t *testing.T) *env {
+// syncBuffer は複数のゴルーチンから書かれるログを集める。
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// lines はログの行を JSON として読む。
+func (b *syncBuffer) lines(t *testing.T) []map[string]any {
+	t.Helper()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(b.buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// newEnv は鍵の読み出しを有効にした環境を作る（鍵の口の試験のため）。
+func newEnv(t *testing.T) *env { return newEnvWith(t, true) }
+
+func newEnvWith(t *testing.T, keyExport bool) *env {
 	t.Helper()
 	addr := os.Getenv("VECGEN_TEST_VALKEY_ADDR")
 	if addr == "" {
@@ -72,24 +111,29 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 
-	logs := logbuf.New(100)
-	log := slog.New(logs.Handler(slog.NewTextHandler(io.Discard, nil)))
-	srv, err := server.New(t.Context(), config.Config{AVTLSHosts: []string{"localhost"}}, st, log)
+	logs := &syncBuffer{}
+	log := slog.New(slog.NewJSONHandler(logs, nil))
+	pins := filepath.Join(t.TempDir(), "admin-clients")
+	if err := os.WriteFile(pins, []byte("test-bff="+strings.Repeat("ab", 32)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := server.New(t.Context(), config.Config{AVTLSHosts: []string{"localhost"}, AdminTLSHosts: []string{"localhost"}, AdminClientsFile: pins}, st, log)
 	if err != nil {
 		t.Fatal(err)
 	}
+	auditDir := t.TempDir()
 	h := &adminapi.Handler{
-		Store:       st,
-		Certs:       srv,
-		Logs:        logs,
-		Log:         log,
-		MgmtClient:  func(*http.Request) string { return "test-bff" },
-		Version:     "test",
-		BootID:      "boot-1",
-		StartedAt:   time.Now().UTC(),
-		AuditMaxLen: 1000,
+		Store:      st,
+		Server:     srv,
+		Audit:      &audit.Recorder{Stream: st, MaxLen: 1000, Files: audit.NewFiles(auditDir, 14), Log: log},
+		Log:        log,
+		MgmtClient: func(*http.Request) string { return "test-bff" },
+		KeyExport:  keyExport,
+		Version:    "test",
+		BootID:     "boot-1",
+		StartedAt:  time.Now().UTC(),
 	}
-	return &env{t: t, h: h.Routes(), store: st, log: log}
+	return &env{t: t, h: h.Routes(), store: st, log: log, logs: logs, auditDir: auditDir}
 }
 
 type response struct {
@@ -209,10 +253,19 @@ func clientCertPEM(t *testing.T, name string, validFor time.Duration) (certPEM, 
 	return string(c), string(k)
 }
 
+// addClient は AV クライアントを登録する（書き込みはコマンドの役目なので、ストアに直接書く）。
 func (e *env) addClient(name string) client {
 	e.t.Helper()
 	pem, _ := clientCertPEM(e.t, name, time.Hour)
-	return decode[client](e.t, e.do("POST", "/clients", map[string]any{"name": name, "certPem": pem}), http.StatusCreated)
+	cert, err := certs.ParsePEM([]byte(pem))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	c, err := e.store.CreateClient(e.t.Context(), store.NewClient{Name: name, Cert: cert, Enabled: true})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return decode[client](e.t, e.do("GET", fmt.Sprintf("/clients/%d", c.ID), nil), http.StatusOK)
 }
 
 func (e *env) audits() []auditEntry {
@@ -333,7 +386,7 @@ func TestSubscriberLifecycle(t *testing.T) {
 		actions = append(actions, a.Action)
 	}
 	want := []string{
-		"client.create", "client.create", "subscriber.create",
+		"subscriber.create",
 		"subscriber.keys.read", "subscriber.update", "subscriber.update", "subscriber.keys.read",
 		"subscriber.state", "subscriber.state", "subscriber.state", "subscriber.reinstate", "subscriber.delete",
 	}
@@ -341,24 +394,24 @@ func TestSubscriberLifecycle(t *testing.T) {
 		t.Fatalf("audit actions = %v, want %v", actions, want)
 	}
 	// 登録と削除には、その時点の状態・SQN・AMF・SQN 増加タイプが残る。
-	if d := audits[2].Detail; d["state"] != "active" || d["sqn"] != "000000000000" || d["amf"] != "8000" || d["sqnType"] != "inc32" {
+	if d := audits[0].Detail; d["state"] != "active" || d["sqn"] != "000000000000" || d["amf"] != "8000" || d["sqnType"] != "inc32" {
 		t.Errorf("create detail = %v", d)
 	}
-	if d := audits[11].Detail; d["state"] != "inactive" || d["sqn"] != "0000000003e0" || d["amf"] != "9001" || d["sqnType"] != "inc33" || audits[11].Target != imsi {
+	if d := audits[9].Detail; d["state"] != "inactive" || d["sqn"] != "0000000003e0" || d["amf"] != "9001" || d["sqnType"] != "inc33" || audits[9].Target != imsi {
 		t.Errorf("delete detail = %v", d)
 	}
 	// 変更には前後の値が残る。
-	if d := fmt.Sprint(audits[4].Detail["sqn"]); !strings.Contains(d, "000000000000") || !strings.Contains(d, "0000000003e0") {
+	if d := fmt.Sprint(audits[2].Detail["sqn"]); !strings.Contains(d, "000000000000") || !strings.Contains(d, "0000000003e0") {
 		t.Errorf("update detail sqn = %v", d)
 	}
 	// 状態の変更には前後の状態と理由が残る。同じ状態への変更には unchanged が付く。
-	if d := audits[7].Detail; fmt.Sprint(d["state"]) != "map[from:active to:inactive]" || d["reason"] != "保守" || d["unchanged"] != nil {
+	if d := audits[5].Detail; fmt.Sprint(d["state"]) != "map[from:active to:inactive]" || d["reason"] != "保守" || d["unchanged"] != nil {
 		t.Errorf("state detail = %v", d)
 	}
-	if d := audits[8].Detail; d["unchanged"] != true {
+	if d := audits[6].Detail; d["unchanged"] != true {
 		t.Errorf("unchanged state detail = %v", d)
 	}
-	if d := audits[10].Detail; fmt.Sprint(d["state"]) != "map[from:terminated to:inactive]" || d["reason"] != "誤って解約した" {
+	if d := audits[8].Detail; fmt.Sprint(d["state"]) != "map[from:terminated to:inactive]" || d["reason"] != "誤って解約した" {
 		t.Errorf("reinstate detail = %v", d)
 	}
 	raw := e.do("GET", "/audit-logs", nil).body
@@ -451,8 +504,9 @@ func TestListSubscribers(t *testing.T) {
 	}
 
 	// 削除したクライアントの ID は、後片付けが終わる前でも応答に含めない。
-	if r := e.do("DELETE", fmt.Sprintf("/clients/%d", c.ID), nil); r.status != http.StatusNoContent {
-		t.Fatalf("delete client: status = %d", r.status)
+	// （削除はコマンドの役目なので、ストアで消す。加入者の集合からの後片付けはまだしない）
+	if err := e.store.DeleteClient(t.Context(), c.ID); err != nil {
+		t.Fatal(err)
 	}
 	p = decode[page](t, e.do("GET", "/subscribers", nil), http.StatusOK)
 	for _, s := range p.Items {
@@ -460,189 +514,48 @@ func TestListSubscribers(t *testing.T) {
 			t.Errorf("subscriber %s still lists the deleted client: %v", s.IMSI, s.AllowedClientIDs)
 		}
 	}
-	// 後片付けは応答の後に行われ、保存されている集合からも消える。
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		sub, err := e.store.GetSubscriber(t.Context(), imsis[0])
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(sub.AllowedClientIDs) == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("deleted client is still in the stored set: %v", sub.AllowedClientIDs)
-		}
-		time.Sleep(20 * time.Millisecond)
+	// 後片付け（コマンドの del が行う）の後は、保存されている集合からも消える。
+	if err := e.store.PurgeClientFromSubscribers(t.Context(), c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if sub, err := e.store.GetSubscriber(t.Context(), imsis[0]); err != nil || len(sub.AllowedClientIDs) != 0 {
+		t.Fatalf("deleted client is still in the stored set: %v, %v", sub.AllowedClientIDs, err)
 	}
 }
 
-func TestClientLifecycle(t *testing.T) {
+func TestClientsReadOnly(t *testing.T) {
+	// AV クライアントとサーバー証明書は読み出しだけ（書き込みはコマンド。設計概要 §9.3）
 	e := newEnv(t)
-	pem, _ := clientCertPEM(t, "radius", time.Hour)
-
-	r := e.do("POST", "/clients", map[string]any{"name": "radius", "certPem": pem})
-	c := decode[client](t, r, http.StatusCreated)
-	if c.ID != 1 || c.Name != "radius" || !c.Enabled || c.NetworkName != "" || c.Subject != "CN=radius" ||
-		len(c.FingerprintSHA256) != 64 || c.NotBefore.IsZero() || !c.NotAfter.After(time.Now()) || c.CertPEM != pem {
-		t.Errorf("created = %+v", c)
+	c1, c2 := e.addClient("radius"), e.addClient("conformance")
+	if c1.ID != 1 || c1.Name != "radius" || !c1.Enabled || len(c1.FingerprintSHA256) != 64 || c1.CertPEM == "" {
+		t.Errorf("client = %+v", c1)
 	}
-	if loc := r.header.Get("Location"); loc != "/admin/v2/clients/1" {
-		t.Errorf("Location = %q", loc)
-	}
-	wantProblem(t, e.do("POST", "/clients", map[string]any{"name": "again", "certPem": pem}), http.StatusConflict, "CERT_ALREADY_REGISTERED")
-
-	// 無効な状態で登録することもできる。
-	pem2, _ := clientCertPEM(t, "second", time.Hour)
-	c2 := decode[client](t, e.do("POST", "/clients", map[string]any{"name": "second", "certPem": pem2, "enabled": false, "networkName": "ETHERNET"}), http.StatusCreated)
-	if c2.Enabled || c2.NetworkName != "ETHERNET" || c2.ID <= c.ID {
-		t.Errorf("second = %+v", c2)
-	}
-
 	list := decode[struct {
 		Items []client `json:"items"`
 	}](t, e.do("GET", "/clients", nil), http.StatusOK)
-	if len(list.Items) != 2 || list.Items[0].ID != c.ID || list.Items[1].ID != c2.ID {
-		t.Errorf("list = %+v", list)
+	if len(list.Items) != 2 || list.Items[1].ID != c2.ID {
+		t.Errorf("list = %+v", list.Items)
+	}
+	wantProblem(t, e.do("GET", "/clients/99", nil), http.StatusNotFound, "CLIENT_NOT_FOUND")
+
+	sc := decode[struct {
+		CertPEM           string `json:"certPem"`
+		FingerprintSHA256 string `json:"fingerprintSha256"`
+	}](t, e.do("GET", "/av-server-certificate", nil), http.StatusOK)
+	if sc.CertPEM == "" || len(sc.FingerprintSHA256) != 64 {
+		t.Errorf("av server certificate = %+v", sc)
 	}
 
-	// 入力の検証。
-	expired, _ := clientCertPEM(t, "expired", time.Minute) // NotBefore が 5 分前なので期限切れになる
-	for _, tt := range []struct {
-		body  any
-		cause string
-	}{
-		{map[string]any{"certPem": pem}, "MANDATORY_IE_MISSING"},
-		{map[string]any{"name": "x"}, "MANDATORY_IE_MISSING"},
-		{map[string]any{"name": "", "certPem": pem}, "MANDATORY_IE_INCORRECT"},
-		{map[string]any{"name": "x", "certPem": "not a pem"}, "INVALID_CERTIFICATE"},
-		{map[string]any{"name": "x", "certPem": expired}, "INVALID_CERTIFICATE"},
-		{map[string]any{"name": "x", "certPem": pem, "networkName": strings.Repeat("n", 256)}, "OPTIONAL_IE_INCORRECT"},
+	for _, tt := range []struct{ method, path string }{
+		{"POST", "/clients"}, {"PATCH", "/clients/1"}, {"DELETE", "/clients/1"}, {"PUT", "/clients/1/certificate"},
+		{"PUT", "/av-server-certificate"}, {"DELETE", "/av-server-certificate"},
 	} {
-		wantProblem(t, e.do("POST", "/clients", tt.body), http.StatusBadRequest, tt.cause)
+		if r := e.do(tt.method, tt.path, "{}"); r.status != http.StatusMethodNotAllowed && r.status != http.StatusNotFound {
+			t.Errorf("%s %s: status = %d, want 405 or 404", tt.method, tt.path, r.status)
+		}
 	}
-
-	// 変更。
-	path := fmt.Sprintf("/clients/%d", c.ID)
-	got := decode[client](t, e.do("PATCH", path, map[string]any{"enabled": false, "networkName": "HRPD"}), http.StatusOK)
-	if got.Enabled || got.NetworkName != "HRPD" || got.Name != "radius" || got.FingerprintSHA256 != c.FingerprintSHA256 {
-		t.Errorf("patched = %+v", got)
-	}
-	// Network Name は空文字列で既定値に戻せる。
-	if got = decode[client](t, e.do("PATCH", path, map[string]any{"networkName": "", "name": "radius-1"}), http.StatusOK); got.NetworkName != "" || got.Name != "radius-1" {
-		t.Errorf("patched = %+v", got)
-	}
-	if got := wantProblem(t, e.do("PATCH", path, `{"name":"","certPem":"x","enabled":null}`), http.StatusBadRequest, "OPTIONAL_IE_INCORRECT"); !slices.Equal(got, []string{"certPem", "enabled", "name"}) {
-		t.Errorf("invalidParams = %v", got)
-	}
-	wantProblem(t, e.do("PATCH", "/clients/999", map[string]any{"enabled": true}), http.StatusNotFound, "CLIENT_NOT_FOUND")
-	wantProblem(t, e.do("GET", "/clients/abc", nil), http.StatusNotFound, "CLIENT_NOT_FOUND")
-
-	// 証明書の差し替え。ID は変わらない。
-	renewed, _ := clientCertPEM(t, "radius-renewed", time.Hour)
-	got = decode[client](t, e.do("PUT", path+"/certificate", map[string]any{"certPem": renewed}), http.StatusOK)
-	if got.ID != c.ID || got.FingerprintSHA256 == c.FingerprintSHA256 || got.Subject != "CN=radius-renewed" || got.CertPEM != renewed || got.Name != "radius-1" {
-		t.Errorf("after replace = %+v", got)
-	}
-	if _, err := e.store.ClientByFingerprint(t.Context(), c.FingerprintSHA256); err == nil {
-		t.Error("old certificate still maps to a client")
-	}
-	wantProblem(t, e.do("PUT", path+"/certificate", map[string]any{"certPem": pem2}), http.StatusConflict, "CERT_ALREADY_REGISTERED")
-	wantProblem(t, e.do("PUT", path+"/certificate", map[string]any{"certPem": "junk"}), http.StatusBadRequest, "INVALID_CERTIFICATE")
-	wantProblem(t, e.do("PUT", path+"/certificate", map[string]any{}), http.StatusBadRequest, "MANDATORY_IE_MISSING")
-	wantProblem(t, e.do("PUT", "/clients/999/certificate", map[string]any{"certPem": renewed}), http.StatusNotFound, "CLIENT_NOT_FOUND")
-	// 古い証明書は、差し替え後に別のクライアントとして登録できる。
-	decode[client](t, e.do("POST", "/clients", map[string]any{"name": "reuse-old-cert", "certPem": pem}), http.StatusCreated)
-
-	// 削除。
-	if r := e.do("DELETE", path, nil); r.status != http.StatusNoContent {
-		t.Fatalf("delete: status = %d", r.status)
-	}
-	wantProblem(t, e.do("GET", path, nil), http.StatusNotFound, "CLIENT_NOT_FOUND")
-	wantProblem(t, e.do("DELETE", path, nil), http.StatusNotFound, "CLIENT_NOT_FOUND")
-
-	var actions []string
-	for _, a := range e.audits() {
-		actions = append(actions, a.Action)
-	}
-	want := []string{"client.create", "client.create", "client.update", "client.update", "client.certificate.replace", "client.create", "client.delete"}
-	if !slices.Equal(actions, want) {
-		t.Errorf("audit actions = %v, want %v", actions, want)
-	}
-}
-
-type serverCert struct {
-	CertPEM           string    `json:"certPem"`
-	Source            string    `json:"source"`
-	FingerprintSHA256 string    `json:"fingerprintSha256"`
-	Subject           string    `json:"subject"`
-	NotAfter          time.Time `json:"notAfter"`
-	UpdatedAt         time.Time `json:"updatedAt"`
-}
-
-func TestAVServerCertificate(t *testing.T) {
-	e := newEnv(t)
-
-	r := e.do("GET", "/av-server-certificate", nil)
-	initial := decode[serverCert](t, r, http.StatusOK)
-	if initial.Source != "self-signed" || initial.Subject != "CN=aka-vecgen" || len(initial.FingerprintSHA256) != 64 {
-		t.Errorf("initial = %+v", initial)
-	}
-	if bytes.Contains(r.body, []byte("PRIVATE KEY")) {
-		t.Errorf("response contains the private key: %s", r.body)
-	}
-
-	// 持ち込みの証明書に差し替える。
-	certPEM, keyPEM, err := certs.SelfSigned(certs.SelfSignedOptions{CommonName: "aka.example.net", Hosts: []string{"aka.example.net"}, ValidFor: time.Hour})
-	if err != nil {
-		t.Fatal(err)
-	}
-	r = e.do("PUT", "/av-server-certificate", map[string]any{"certPem": string(certPEM), "keyPem": string(keyPEM)})
-	uploaded := decode[serverCert](t, r, http.StatusOK)
-	if uploaded.Source != "uploaded" || uploaded.Subject != "CN=aka.example.net" || uploaded.FingerprintSHA256 == initial.FingerprintSHA256 {
-		t.Errorf("uploaded = %+v", uploaded)
-	}
-	if bytes.Contains(r.body, []byte("PRIVATE KEY")) {
-		t.Errorf("response contains the private key: %s", r.body)
-	}
-	if got := decode[serverCert](t, e.do("GET", "/av-server-certificate", nil), http.StatusOK); got.FingerprintSHA256 != uploaded.FingerprintSHA256 {
-		t.Errorf("get after put = %+v", got)
-	}
-
-	// 不正な入力では差し替えない。
-	_, otherKey, _ := certs.SelfSigned(certs.SelfSignedOptions{CommonName: "other", ValidFor: time.Hour})
-	expiredCert, expiredKey, _ := certs.SelfSigned(certs.SelfSignedOptions{CommonName: "expired", ValidFor: time.Minute})
-	for _, tt := range []struct {
-		body  any
-		cause string
-	}{
-		{map[string]any{"certPem": string(certPEM)}, "MANDATORY_IE_MISSING"},
-		{map[string]any{"certPem": string(certPEM), "keyPem": string(otherKey)}, "INVALID_CERTIFICATE"},
-		{map[string]any{"certPem": "junk", "keyPem": string(keyPEM)}, "INVALID_CERTIFICATE"},
-		{map[string]any{"certPem": string(expiredCert), "keyPem": string(expiredKey)}, "INVALID_CERTIFICATE"},
-	} {
-		wantProblem(t, e.do("PUT", "/av-server-certificate", tt.body), http.StatusBadRequest, tt.cause)
-	}
-	if got := decode[serverCert](t, e.do("GET", "/av-server-certificate", nil), http.StatusOK); got.FingerprintSHA256 != uploaded.FingerprintSHA256 {
-		t.Errorf("certificate changed by a rejected put: %+v", got)
-	}
-
-	// 削除すると自己署名を再生成する。証明書のない状態にはならない。
-	reset := decode[serverCert](t, e.do("DELETE", "/av-server-certificate", nil), http.StatusOK)
-	if reset.Source != "self-signed" || reset.FingerprintSHA256 == uploaded.FingerprintSHA256 || reset.FingerprintSHA256 == initial.FingerprintSHA256 {
-		t.Errorf("reset = %+v", reset)
-	}
-
-	status := decode[struct {
-		NotAfter time.Time `json:"avServerCertificateNotAfter"`
-	}](t, e.do("GET", "/status", nil), http.StatusOK)
-	if !status.NotAfter.Equal(reset.NotAfter) {
-		t.Errorf("status notAfter = %v, want %v", status.NotAfter, reset.NotAfter)
-	}
-
-	audits := e.audits()
-	if len(audits) != 2 || audits[0].Action != "av-server-certificate.replace" || audits[1].Action != "av-server-certificate.reset" {
-		t.Errorf("audits = %+v", audits)
+	if r := e.do("GET", "/logs", nil); r.status != http.StatusNotFound {
+		t.Errorf("GET /logs: status = %d, want 404 (removed)", r.status)
 	}
 }
 
@@ -652,64 +565,29 @@ func TestStatus(t *testing.T) {
 	decode[subscriber](t, e.do("POST", "/subscribers", map[string]any{"imsi": "44010", "ki": testKi, "opc": testOPc, "state": "active"}), http.StatusCreated)
 
 	s := decode[struct {
-		Version         string    `json:"version"`
-		BootID          string    `json:"bootId"`
-		StartedAt       time.Time `json:"startedAt"`
-		SubscriberCount int       `json:"subscriberCount"`
-		ClientCount     int       `json:"clientCount"`
+		Version                        string    `json:"version"`
+		BootID                         string    `json:"bootId"`
+		StartedAt                      time.Time `json:"startedAt"`
+		AVAPIContractVersion           string    `json:"avApiContractVersion"`
+		SubscriberCount                int       `json:"subscriberCount"`
+		ClientCount                    int       `json:"clientCount"`
+		AVServerCertificateNotAfter    time.Time `json:"avServerCertificateNotAfter"`
+		AdminServerCertificateNotAfter time.Time `json:"adminServerCertificateNotAfter"`
+		KEKID                          string    `json:"kekId"`
+		AdminClients                   []string  `json:"adminClients"`
+		AdminClientsLoadedAt           time.Time `json:"adminClientsLoadedAt"`
 	}](t, e.do("GET", "/status", nil), http.StatusOK)
-	if s.Version != "test" || s.BootID != "boot-1" || s.StartedAt.IsZero() || s.SubscriberCount != 1 || s.ClientCount != 1 {
+	if s.Version != "test" || s.BootID != "boot-1" || s.StartedAt.IsZero() || s.SubscriberCount != 1 || s.ClientCount != 1 ||
+		s.AVAPIContractVersion != "1.0.0" || s.AVServerCertificateNotAfter.IsZero() || s.AdminServerCertificateNotAfter.IsZero() ||
+		len(s.KEKID) != 16 || !slices.Equal(s.AdminClients, []string{"test-bff"}) || s.AdminClientsLoadedAt.IsZero() {
 		t.Errorf("status = %+v", s)
-	}
-}
-
-func TestLogs(t *testing.T) {
-	e := newEnv(t)
-	type logList struct {
-		BootID string `json:"bootId"`
-		Items  []struct {
-			Seq   int64          `json:"seq"`
-			Level string         `json:"level"`
-			Msg   string         `json:"msg"`
-			Attrs map[string]any `json:"attrs"`
-		} `json:"items"`
-		LastSeq int64 `json:"lastSeq"`
-	}
-
-	e.log.Warn("first marker", "imsi", "44010")
-	all := decode[logList](t, e.do("GET", "/logs", nil), http.StatusOK)
-	if all.BootID != "boot-1" || len(all.Items) == 0 {
-		t.Fatalf("logs = %+v", all)
-	}
-	last := all.Items[len(all.Items)-1]
-	if last.Msg != "first marker" || last.Level != "WARN" || last.Attrs["imsi"] != "44010" || all.LastSeq != last.Seq {
-		t.Errorf("last entry = %+v, lastSeq = %d", last, all.LastSeq)
-	}
-
-	// after を指定すると、それより後のログだけを返す。
-	none := decode[logList](t, e.do("GET", fmt.Sprintf("/logs?after=%d", all.LastSeq), nil), http.StatusOK)
-	if len(none.Items) != 0 || none.LastSeq != all.LastSeq {
-		t.Errorf("nothing new: %+v", none)
-	}
-	e.log.Info("second marker")
-	e.log.Info("third marker")
-	next := decode[logList](t, e.do("GET", fmt.Sprintf("/logs?after=%d&limit=1", all.LastSeq), nil), http.StatusOK)
-	if len(next.Items) != 1 || next.Items[0].Msg != "second marker" || next.LastSeq != all.LastSeq+1 {
-		t.Errorf("next = %+v", next)
-	}
-	if latest := decode[logList](t, e.do("GET", "/logs?limit=1", nil), http.StatusOK); len(latest.Items) != 1 || latest.Items[0].Msg != "third marker" {
-		t.Errorf("latest = %+v", latest)
-	}
-
-	for _, q := range []string{"after=-1", "after=x", "limit=0", "limit=1001"} {
-		wantProblem(t, e.do("GET", "/logs?"+q, nil), http.StatusBadRequest, "INVALID_QUERY_PARAM")
 	}
 }
 
 func TestAuditLogPaging(t *testing.T) {
 	e := newEnv(t)
 	for i := range 5 {
-		e.addClient(fmt.Sprintf("c%d", i))
+		decode[subscriber](t, e.do("POST", "/subscribers", map[string]any{"imsi": fmt.Sprintf("4401000000000%02d", i+1), "ki": testKi, "opc": testOPc, "state": "active"}), http.StatusCreated)
 	}
 	var targets []string
 	path := "/audit-logs?limit=2"
@@ -723,7 +601,7 @@ func TestAuditLogPaging(t *testing.T) {
 		}
 		path = "/audit-logs?limit=2&before=" + list.NextBefore
 	}
-	if want := []string{"5", "4", "3", "2", "1"}; !slices.Equal(targets, want) {
+	if want := []string{"440100000000005", "440100000000004", "440100000000003", "440100000000002", "440100000000001"}; !slices.Equal(targets, want) {
 		t.Errorf("targets = %v, want %v", targets, want)
 	}
 	for _, q := range []string{"before=abc", "limit=0", "limit=501"} {
@@ -734,7 +612,7 @@ func TestAuditLogPaging(t *testing.T) {
 func TestOperatorHeader(t *testing.T) {
 	e := newEnv(t)
 	send := func(operator string) response {
-		req := httptest.NewRequest("POST", "/admin/v2/clients", strings.NewReader(`{"name":"c","certPem":"`+strings.ReplaceAll(must(clientCertPEM(t, "c"+operator, time.Hour)), "\n", `\n`)+`"}`))
+		req := httptest.NewRequest("POST", "/admin/v2/subscribers", strings.NewReader(`{"imsi":"44010","ki":"`+testKi+`","opc":"`+testOPc+`","state":"active"}`))
 		if operator != "" {
 			req.Header.Set("X-Operator-Id", operator)
 		}
@@ -810,26 +688,16 @@ func TestTraceID(t *testing.T) {
 		t.Errorf("audit traceIds = %v, want %v", traces, want)
 	}
 
-	// 処理を終えたリクエストを admin request completed として記録する。GET /logs は info では記録しない。
-	type logList struct {
-		Items []struct {
-			Level string         `json:"level"`
-			Msg   string         `json:"msg"`
-			Attrs map[string]any `json:"attrs"`
-		} `json:"items"`
-	}
+	// 処理を終えたリクエストを admin request completed（ADMIN_REQUEST）として記録する。
 	completed := map[string]map[string]any{}
-	for _, l := range decode[logList](t, e.do("GET", "/logs", nil), http.StatusOK).Items {
-		if l.Msg != "admin request completed" {
+	for _, l := range e.logs.lines(t) {
+		if l["msg"] != "admin request completed" {
 			continue
 		}
-		if l.Level != "INFO" {
-			t.Errorf("level = %s", l.Level)
+		if l["level"] != "INFO" || l["event_id"] != "ADMIN_REQUEST" {
+			t.Errorf("log = %v", l)
 		}
-		if l.Attrs["path"] == "/admin/v2/logs" {
-			t.Errorf("GET /logs is logged at info: %v", l.Attrs)
-		}
-		completed[fmt.Sprint(l.Attrs["trace_id"])] = l.Attrs
+		completed[fmt.Sprint(l["trace_id"])] = l
 	}
 	if a := completed["trace-001"]; a == nil || a["method"] != "POST" || a["path"] != "/admin/v2/subscribers" ||
 		fmt.Sprint(a["http_status"]) != "201" || a["mgmt_client"] != "test-bff" || a["operator"] != "alice" {
@@ -844,5 +712,96 @@ func TestTraceID(t *testing.T) {
 	}
 }
 
-// must は 2 値を返す関数の 1 つ目を取り出す。
-func must(a, _ string) string { return a }
+func TestBatchGet(t *testing.T) {
+	e := newEnv(t)
+	c := e.addClient("c")
+	for _, imsi := range []string{"001010000000001", "001010000000003"} {
+		decode[subscriber](t, e.do("POST", "/subscribers", map[string]any{"imsi": imsi, "ki": testKi, "opc": testOPc, "state": "active", "allowedClientIds": []int64{c.ID}}), http.StatusCreated)
+	}
+	type result struct {
+		Items    []subscriber `json:"items"`
+		NotFound []string     `json:"notFound"`
+	}
+	got := decode[result](t, e.do("POST", "/subscribers/batch-get", map[string]any{
+		"imsis": []string{"001010000000003", "001010000000002", "001010000000001", "001010000000003"},
+	}), http.StatusOK)
+	if len(got.Items) != 2 || got.Items[0].IMSI != "001010000000003" || got.Items[1].IMSI != "001010000000001" ||
+		!slices.Equal(got.NotFound, []string{"001010000000002"}) || got.Items[0].State != "active" ||
+		!slices.Equal(got.Items[0].AllowedClientIDs, []int64{c.ID}) {
+		t.Errorf("batch-get = %+v", got)
+	}
+	// 鍵は返さない
+	if r := e.do("POST", "/subscribers/batch-get", map[string]any{"imsis": []string{"001010000000001"}}); strings.Contains(string(r.body), testKi) {
+		t.Errorf("batch-get returned the key: %s", r.body)
+	}
+	none := decode[result](t, e.do("POST", "/subscribers/batch-get", map[string]any{"imsis": []string{"001010000000009"}}), http.StatusOK)
+	if none.Items == nil || len(none.Items) != 0 || len(none.NotFound) != 1 {
+		t.Errorf("none = %+v (items must be [] not null)", none)
+	}
+
+	tooMany := make([]string, 501)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("00101%010d", i)
+	}
+	tests := []struct {
+		body  any
+		cause string
+		param string
+	}{
+		{map[string]any{}, "MANDATORY_IE_MISSING", "imsis"},
+		{map[string]any{"imsis": []string{}}, "MANDATORY_IE_INCORRECT", "imsis"},
+		{map[string]any{"imsis": tooMany}, "MANDATORY_IE_INCORRECT", "imsis"},
+		{map[string]any{"imsis": []string{"001010000000001", "12ab"}}, "MANDATORY_IE_INCORRECT", "imsis[1]"},
+	}
+	for _, tt := range tests {
+		if got := wantProblem(t, e.do("POST", "/subscribers/batch-get", tt.body), http.StatusBadRequest, tt.cause); !slices.Equal(got, []string{tt.param}) {
+			t.Errorf("%v: invalidParams = %v", tt.body, got)
+		}
+	}
+}
+
+func TestKeyExportDisabled(t *testing.T) {
+	// 鍵の読み出しは既定で無効（VECGEN_KEY_EXPORT=true のときだけ。設計概要 §8.4）
+	e := newEnvWith(t, false)
+	decode[subscriber](t, e.do("POST", "/subscribers", map[string]any{"imsi": "001010000000001", "ki": testKi, "opc": testOPc, "state": "active"}), http.StatusCreated)
+	r := e.do("GET", "/subscribers/001010000000001/keys", nil)
+	wantProblem(t, r, http.StatusNotFound, "KEY_EXPORT_DISABLED")
+	if strings.Contains(string(r.body), testKi) {
+		t.Errorf("body contains the key: %s", r.body)
+	}
+	for _, a := range e.audits() {
+		if a.Action == "subscriber.keys.read" {
+			t.Error("a refused key export was audited as a read")
+		}
+	}
+}
+
+func TestAuditFile(t *testing.T) {
+	// 監査ログは Stream に加えて、日ごとのファイルにも書く（設計概要 §13.2）
+	e := newEnv(t)
+	req := httptest.NewRequest("POST", "/admin/v2/subscribers", strings.NewReader(`{"imsi":"001010000000001","ki":"`+testKi+`","opc":"`+testOPc+`","state":"active"}`))
+	req.Header.Set("X-Operator-Id", "alice")
+	req.Header.Set("X-Trace-ID", "trace-file")
+	e.h.ServeHTTP(httptest.NewRecorder(), req)
+
+	files, err := filepath.Glob(filepath.Join(e.auditDir, "audit-*.jsonl"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("audit files = %v, %v", files, err)
+	}
+	data, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var line map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &line); err != nil {
+		t.Fatalf("%s: %v", data, err)
+	}
+	stream := e.audits()
+	if line["action"] != "subscriber.create" || line["operator"] != "alice" || line["mgmtClient"] != "test-bff" ||
+		line["traceId"] != "trace-file" || line["target"] != "001010000000001" || line["streamId"] != stream[0].ID {
+		t.Errorf("audit file line = %v", line)
+	}
+	if strings.Contains(string(data), testKi) {
+		t.Error("the audit file contains the key")
+	}
+}

@@ -28,7 +28,11 @@ func TestHTTPErrorLog(t *testing.T) {
 		l := newHTTPErrorLog(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		l.Print(tc.line)
 		out := buf.String()
-		if !strings.Contains(out, `"level":"`+tc.level+`"`) || !strings.Contains(out, `"msg":"`+tc.line+`"`) {
+		eventID := "TLS_HANDSHAKE_ERR"
+		if strings.HasPrefix(tc.line, "http: panic") {
+			eventID = "HTTP_SERVER_ERR"
+		}
+		if !strings.Contains(out, `"level":"`+tc.level+`"`) || !strings.Contains(out, `"msg":"`+tc.line+`"`) || !strings.Contains(out, `"event_id":"`+eventID+`"`) {
 			t.Errorf("%q: got %s, want level %s", tc.line, out, tc.level)
 		}
 	}

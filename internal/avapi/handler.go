@@ -118,7 +118,7 @@ func (h *Handler) generateAV(w http.ResponseWriter, r *http.Request) {
 
 	req, p := parseRequest(w, r)
 	if p != nil {
-		log.Warn("av request rejected", "cause", p.cause, "detail", p.detail)
+		log.Warn("av request rejected", "event_id", "AV_REJECTED", "cause", p.cause, "detail", p.detail)
 		p.write(w)
 		return
 	}
@@ -128,23 +128,24 @@ func (h *Handler) generateAV(w http.ResponseWriter, r *http.Request) {
 	if p != nil {
 		switch {
 		case p.status >= http.StatusInternalServerError:
+			// 理由（例 subscriber_cred_invalid）はログにだけ残す
 			if p.reason != "" {
 				log = log.With("reason", p.reason)
 			}
-			log.Error("av request failed", "cause", p.cause, "detail", p.detail)
+			log.Error("av request failed", "event_id", "AV_FAILED", "cause", p.cause, "detail", p.detail)
 			// 内部エラーの詳細はクライアントに返さない。
 			p.detail = ""
 		case p.reason != "":
 			// 一般的な拒否。理由はログにだけ残す（契約 §9.2）。
-			log.Warn("av request rejected", "cause", p.cause, "reason", p.reason)
+			log.Warn("av request rejected", "event_id", "AV_REJECTED", "cause", p.cause, "reason", p.reason)
 		default:
-			log.Warn("av request rejected", "cause", p.cause, "detail", p.detail)
+			log.Warn("av request rejected", "event_id", "AV_REJECTED", "cause", p.cause, "detail", p.detail)
 		}
 		p.write(w)
 		return
 	}
 
-	log.Info("av generated")
+	log.Info("av generated", "event_id", "AV_ISSUED")
 	w.Header().Set("Content-Type", "application/json")
 	json.MarshalWrite(w, generateAVResponse{HSSAuthenticationVectors: vectors})
 }

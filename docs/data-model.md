@@ -208,9 +208,13 @@ AV 用と管理API 用で、同じ形式の Hash を別々のキーに持つ。
 
 - 加入者の登録と削除では、その時点の `sqn`、`amf`、`sqn_type` を入れる。
 - 変更では、変更した項目の前後の値を入れる。
-- Ki と OPc は値を入れず、変更の有無だけを入れる。
+- Ki と OPc は入れない（登録の後に変える口はない）。
 
 取得は `XREVRANGE` で新しい順に読み、エントリID でページングする。
+
+コマンドの操作は、`operator` に `-operator` の値（既定 `cli`）、`mgmt_client` に `cli` を入れる。SIGHUP での読み直しは `operator` が `sighup`、`action` が `reload`。
+
+同じ監査ログを、日ごとの追記だけのファイル（`VECGEN_AUDIT_DIR` の `audit-YYYYMMDD.jsonl`、日本時間で区切る）にも書く（設計概要 §13.2）。ファイルの 1 行は `time`・`operator`・`mgmtClient`・`action`・`target`・`detail`・`traceId`・`streamId`（上のエントリID）。
 
 ## 8. 永続化
 

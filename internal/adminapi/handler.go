@@ -4,7 +4,6 @@ package adminapi
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"log/slog"
@@ -14,7 +13,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/oyaguma3/aka-vecgen/internal/logbuf"
+	"github.com/oyaguma3/aka-vecgen/internal/audit"
 	"github.com/oyaguma3/aka-vecgen/internal/store"
 	"github.com/oyaguma3/aka-vecgen/internal/traceid"
 )
@@ -32,46 +31,39 @@ type Store interface {
 	SetState(ctx context.Context, imsi string, to store.State) (from store.State, unchanged bool, err error)
 	Reinstate(ctx context.Context, imsi string) (store.State, error)
 	ListSubscribers(ctx context.Context, prefix, cursor string, limit int) (store.SubscriberPage, error)
+	GetSubscribers(ctx context.Context, imsis []string) ([]store.Subscriber, error)
 	CountSubscribers(ctx context.Context) (int64, error)
 
-	CreateClient(ctx context.Context, nc store.NewClient) (store.Client, error)
 	GetClient(ctx context.Context, id int64) (store.Client, error)
 	ListClients(ctx context.Context) ([]store.Client, error)
-	UpdateClient(ctx context.Context, id int64, p store.ClientPatch) error
-	ReplaceClientCertificate(ctx context.Context, id int64, cert *x509.Certificate) error
-	DeleteClient(ctx context.Context, id int64) error
-	PurgeClientFromSubscribers(ctx context.Context, id int64) error
 	ClientIDs(ctx context.Context) ([]int64, error)
 	CountClients(ctx context.Context) (int64, error)
 
-	AppendAudit(ctx context.Context, e store.AuditEntry, maxLen int64) error
 	ListAudit(ctx context.Context, before string, limit int) ([]store.AuditEntry, string, error)
 }
 
-// AVCertificates は認証ベクターAPI 用のサーバー証明書を扱う。
-// 差し替えは、動作中のリスナーにも反映される。
-type AVCertificates interface {
+// Server は、動いているサーバーの状態（証明書と管理クライアント）を返す。
+// AV クライアントとサーバー証明書の書き込みはノードの上のコマンドで行い、管理API は読み出しだけにする（設計概要 §9.3）。
+type Server interface {
 	AVCertificate(ctx context.Context) (store.ServerCertificate, error)
-	// ReplaceAVCertificate は持ち込みの証明書に差し替える。内容が不正なら certs.ErrInvalid を返す。
-	ReplaceAVCertificate(ctx context.Context, certPEM, keyPEM []byte) (store.ServerCertificate, error)
-	// ResetAVCertificate は自己署名証明書を再生成して置き換える。
-	ResetAVCertificate(ctx context.Context) (store.ServerCertificate, error)
+	CertificateNotAfter() (av, admin time.Time)
+	AdminClients() (names []string, loadedAt time.Time)
 }
 
 // Handler は管理API のハンドラー。
 type Handler struct {
-	Store Store
-	Certs AVCertificates
-	Logs  *logbuf.Buffer
-	Log   *slog.Logger
+	Store  Store
+	Server Server
+	Audit  *audit.Recorder
+	Log    *slog.Logger
 	// MgmtClient はリクエストから管理クライアントの識別名を取り出す。
 	MgmtClient func(*http.Request) string
+	// KeyExport は鍵の読み出しの口を有効にするか（VECGEN_KEY_EXPORT。設計概要 §8.4）。
+	KeyExport bool
 
 	Version   string
 	BootID    string
 	StartedAt time.Time
-	// AuditMaxLen は監査ログの保持件数の上限。
-	AuditMaxLen int64
 }
 
 // Routes は管理API のルーティングを返す。
@@ -81,6 +73,7 @@ func (h *Handler) Routes() http.Handler {
 
 	mux.HandleFunc("GET /admin/v2/subscribers", h.listSubscribers)
 	mux.HandleFunc("POST /admin/v2/subscribers", h.createSubscriber)
+	mux.HandleFunc("POST /admin/v2/subscribers/batch-get", h.batchGetSubscribers)
 	mux.HandleFunc("GET /admin/v2/subscribers/{imsi}", h.getSubscriber)
 	mux.HandleFunc("PATCH /admin/v2/subscribers/{imsi}", h.updateSubscriber)
 	mux.HandleFunc("DELETE /admin/v2/subscribers/{imsi}", h.deleteSubscriber)
@@ -88,18 +81,11 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /admin/v2/subscribers/{imsi}/reinstate", h.reinstateSubscriber)
 	mux.HandleFunc("GET /admin/v2/subscribers/{imsi}/keys", h.getSubscriberKeys)
 
+	// AV クライアントとサーバー証明書は読み出しだけ（書き込みはノードの上のコマンド。設計概要 §9.3）
 	mux.HandleFunc("GET /admin/v2/clients", h.listClients)
-	mux.HandleFunc("POST /admin/v2/clients", h.createClient)
 	mux.HandleFunc("GET /admin/v2/clients/{clientId}", h.getClient)
-	mux.HandleFunc("PATCH /admin/v2/clients/{clientId}", h.updateClient)
-	mux.HandleFunc("DELETE /admin/v2/clients/{clientId}", h.deleteClient)
-	mux.HandleFunc("PUT /admin/v2/clients/{clientId}/certificate", h.replaceClientCertificate)
-
 	mux.HandleFunc("GET /admin/v2/av-server-certificate", h.getAVServerCertificate)
-	mux.HandleFunc("PUT /admin/v2/av-server-certificate", h.replaceAVServerCertificate)
-	mux.HandleFunc("DELETE /admin/v2/av-server-certificate", h.resetAVServerCertificate)
 
-	mux.HandleFunc("GET /admin/v2/logs", h.listLogs)
 	mux.HandleFunc("GET /admin/v2/audit-logs", h.listAuditLogs)
 	return h.observe(checkOperator(mux))
 }
@@ -113,8 +99,7 @@ func traceID(r *http.Request) string {
 }
 
 // observe は X-Trace-ID ヘッダーのトレースID を使い（なければ採番し）、応答の X-Trace-ID ヘッダーで返す。
-// 処理を終えたリクエストは admin request completed として記録する。
-// GET /logs は管理 GUI が数秒ごとに呼ぶため、debug レベルにする（info だと、取得した記録自体がログに積もり続ける）。
+// 処理を終えたリクエストは admin request completed（ADMIN_REQUEST）として記録する。
 func (h *Handler) observe(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -125,10 +110,6 @@ func (h *Handler) observe(next http.Handler) http.Handler {
 
 		next.ServeHTTP(rec, r)
 
-		level := slog.LevelInfo
-		if r.Method == http.MethodGet && r.URL.Path == "/admin/v2/logs" {
-			level = slog.LevelDebug
-		}
 		operator := r.Header.Get(operatorHeader)
 		if !operatorPattern.MatchString(operator) {
 			operator = "" // 形式の違う値は 400 で断っており、そのままは記録しない
@@ -137,7 +118,8 @@ func (h *Handler) observe(next http.Handler) http.Handler {
 		if err != nil {
 			srcIP = r.RemoteAddr
 		}
-		h.Log.Log(r.Context(), level, "admin request completed",
+		h.Log.Info("admin request completed",
+			"event_id", "ADMIN_REQUEST",
 			"trace_id", id,
 			"method", r.Method,
 			"path", r.URL.Path,
@@ -202,8 +184,7 @@ const (
 	causeSubscriberTerminated = "SUBSCRIBER_TERMINATED"
 	causeTransitionNotAllowed = "STATE_TRANSITION_NOT_ALLOWED"
 	causeClientNotFound       = "CLIENT_NOT_FOUND"
-	causeCertRegistered       = "CERT_ALREADY_REGISTERED"
-	causeInvalidCertificate   = "INVALID_CERTIFICATE"
+	causeKeyExportDisabled    = "KEY_EXPORT_DISABLED"
 	causeSystemFailure        = "SYSTEM_FAILURE"
 )
 
@@ -238,7 +219,7 @@ func (p *problem) write(w http.ResponseWriter) {
 
 // internalError は内部エラーを記録し、詳細を伏せた 500 を返す。
 func (h *Handler) internalError(w http.ResponseWriter, r *http.Request, err error) {
-	h.Log.Error("admin request failed", "trace_id", traceID(r), "method", r.Method, "path", r.URL.Path, "error", err)
+	h.Log.Error("admin request failed", "event_id", "ADMIN_ERROR", "trace_id", traceID(r), "method", r.Method, "path", r.URL.Path, "error", err)
 	newProblem(http.StatusInternalServerError, causeSystemFailure, "").write(w)
 }
 
@@ -350,15 +331,9 @@ func (h *Handler) audit(r *http.Request, action, target string, detail any) {
 	if detail != nil {
 		b, err := json.Marshal(detail)
 		if err != nil {
-			h.Log.Error("marshal audit detail", "trace_id", e.TraceID, "action", action, "error", err)
+			h.Log.Error("marshal audit detail", "event_id", "AUDIT_WRITE_ERR", "trace_id", e.TraceID, "action", action, "error", err)
 		}
 		e.Detail = string(b)
 	}
-	h.Log.Info("audit", "trace_id", e.TraceID, "operator", e.Operator, "mgmt_client", e.MgmtClient, "action", action, "target", target, "detail", e.Detail)
-	// リクエストが途中で切れても記録は残す。
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-	defer cancel()
-	if err := h.Store.AppendAudit(ctx, e, h.AuditMaxLen); err != nil {
-		h.Log.Error("append audit", "trace_id", e.TraceID, "action", action, "target", target, "error", err)
-	}
+	h.Audit.Record(r.Context(), e)
 }

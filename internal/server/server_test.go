@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -245,24 +247,31 @@ func TestAVCertificateIsReused(t *testing.T) {
 	}
 }
 
-// 管理API のリスナーは、静的に設定された管理クライアントの証明書だけを受け付ける。
-func TestAdminClientIdentification(t *testing.T) {
-	configured, fp := clientCert(t, time.Hour)
-	expired, expiredFP := clientCert(t, time.Minute) // SelfSigned は NotBefore を 5 分前にするので期限切れになる
-	cfg := config.Config{
-		AVTLSHosts:    []string{"127.0.0.1"},
-		AdminTLSHosts: []string{"127.0.0.1"},
-		AdminClients:  map[string]string{fp: "bff", expiredFP: "old-bff"},
+// writePins は管理クライアントのピンのファイルを書く。
+func writePins(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	fs := newFakeStore()
+}
+
+// startAdmin は、ピンのファイルを pins で作ってサーバーと管理API のリスナーを立て、URL を返す。
+func startAdmin(t *testing.T, fs *fakeStore, pins string) (*Server, string, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "admin-clients")
+	writePins(t, path, pins)
+	cfg := config.Config{
+		AVTLSHosts:       []string{"127.0.0.1"},
+		AdminTLSHosts:    []string{"127.0.0.1"},
+		AdminClientsFile: path,
+	}
 	s, err := New(t.Context(), cfg, fs, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !s.AdminEnabled() {
-		t.Fatal("AdminEnabled = false with configured admin clients")
+		t.Fatal("AdminEnabled = false with an admin clients file")
 	}
-
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", s.adminTLSConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -272,7 +281,15 @@ func TestAdminClientIdentification(t *testing.T) {
 	}))
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
-	url := "https://" + ln.Addr().String()
+	return s, "https://" + ln.Addr().String(), path
+}
+
+// 管理API のリスナーは、ピンのファイルの管理クライアントの証明書だけを受け付ける。
+func TestAdminClientIdentification(t *testing.T) {
+	configured, fp := clientCert(t, time.Hour)
+	expired, expiredFP := clientCert(t, time.Minute) // SelfSigned は NotBefore を 5 分前にするので期限切れになる
+	fs := newFakeStore()
+	_, url, _ := startAdmin(t, fs, "bff="+fp+"\nold-bff="+expiredFP+"\n")
 
 	// 管理API は AV とは別のサーバー証明書を提示する。
 	adminPEM, avPEM := fs.certs[store.CertSlotAdmin].CertPEM, fs.certs[store.CertSlotAV].CertPEM
@@ -305,41 +322,103 @@ func TestAdminClientIdentification(t *testing.T) {
 	}
 }
 
-// 管理クライアントが設定されていなければ、管理API を起動せず、証明書も作らない。
-func TestAdminDisabledWithoutClients(t *testing.T) {
+// ピンのファイルがなければ、管理API を起動せず、証明書も作らない。形の違うファイルなら起動しない。
+func TestAdminDisabledWithoutClientsFile(t *testing.T) {
 	fs := newFakeStore()
-	s, err := New(t.Context(), config.Config{AVTLSHosts: []string{"localhost"}}, fs, slog.New(slog.DiscardHandler))
+	path := filepath.Join(t.TempDir(), "admin-clients")
+	s, err := New(t.Context(), config.Config{AVTLSHosts: []string{"localhost"}, AdminClientsFile: path}, fs, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if s.AdminEnabled() {
-		t.Error("AdminEnabled = true without admin clients")
+		t.Error("AdminEnabled = true without an admin clients file")
 	}
 	if _, ok := fs.certs[store.CertSlotAdmin]; ok {
 		t.Error("admin certificate was generated although the admin api is disabled")
 	}
+	if names, _ := s.AdminClients(); names != nil {
+		t.Errorf("AdminClients() = %v", names)
+	}
+	writePins(t, path, "not a pin\n")
+	if _, err := New(t.Context(), config.Config{AVTLSHosts: []string{"localhost"}, AdminClientsFile: path}, fs, slog.New(slog.DiscardHandler)); err == nil {
+		t.Error("New with a broken admin clients file: want error")
+	}
 }
 
-// AV 用サーバー証明書の差し替えは、動作中のリスナーの新しい接続に反映される。
-func TestAVCertificateHotSwap(t *testing.T) {
+// SIGHUP（Reload）でピンのファイルを読み直す。空のファイルなら誰も通さず、後から足せる。
+// 読み直しに失敗したら前の設定のまま。
+func TestAdminClientsReload(t *testing.T) {
+	first, firstFP := clientCert(t, time.Hour)
+	second, secondFP := clientCert(t, time.Hour)
+	fs := newFakeStore()
+	s, url, path := startAdmin(t, fs, "# まだ誰もいない\n")
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(fs.certs[store.CertSlotAdmin].CertPEM)
+	if _, _, err := get(url, pool, &first); err == nil {
+		t.Fatal("empty pins file: want handshake failure")
+	}
+
+	// 同じ識別名に新旧 2 つ（証明書の入れ替えの間）
+	writePins(t, path, "prov="+firstFP+"\nprov="+secondFP+"\n")
+	res, err := s.Reload(t.Context())
+	if err != nil || !slices.Equal(res.AdminClients, []string{"prov"}) {
+		t.Fatalf("Reload = %+v, %v", res, err)
+	}
+	for _, c := range []*tls.Certificate{&first, &second} {
+		if status, body, err := get(url, pool, c); err != nil || status != http.StatusOK || body != "prov" {
+			t.Errorf("after reload: status = %d, body = %q, err = %v", status, body, err)
+		}
+	}
+	names, loadedAt := s.AdminClients()
+	if !slices.Equal(names, []string{"prov"}) || loadedAt.IsZero() {
+		t.Errorf("AdminClients() = %v, %v", names, loadedAt)
+	}
+
+	// 形の違うファイルでは前の設定のまま
+	writePins(t, path, "prov=xyz\n")
+	if _, err := s.Reload(t.Context()); err == nil {
+		t.Error("Reload with a broken file: want error")
+	}
+	if status, _, err := get(url, pool, &second); err != nil || status != http.StatusOK {
+		t.Errorf("after a failed reload: status = %d, err = %v", status, err)
+	}
+
+	// 古い証明書を外す
+	writePins(t, path, "prov="+secondFP+"\n")
+	if _, err := s.Reload(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := get(url, pool, &first); err == nil {
+		t.Error("removed certificate: want handshake failure")
+	}
+}
+
+// コマンドで Valkey の AV 用サーバー証明書を差し替えたら、SIGHUP（Reload）で動作中のリスナーの新しい接続に反映される。
+// 読めない証明書なら前のまま続ける。
+func TestAVCertificateReload(t *testing.T) {
 	fs := newFakeStore()
 	url, _ := startMTLSWithServer(t, fs, func(s *Server) {
+		res, err := s.Reload(t.Context())
+		if err != nil || res.AVCertChanged {
+			t.Fatalf("Reload without change = %+v, %v", res, err)
+		}
 		certPEM, keyPEM, err := certs.SelfSigned(certs.SelfSignedOptions{CommonName: "swapped", Hosts: []string{"127.0.0.1"}, ValidFor: time.Hour})
 		if err != nil {
 			t.Fatal(err)
 		}
-		sc, err := s.ReplaceAVCertificate(t.Context(), certPEM, keyPEM)
-		if err != nil {
+		if err := fs.SetServerCertificate(t.Context(), store.CertSlotAV, certPEM, keyPEM, store.CertSourceUploaded); err != nil {
 			t.Fatal(err)
 		}
-		if sc.Source != store.CertSourceUploaded {
-			t.Errorf("Source = %q", sc.Source)
+		if res, err := s.Reload(t.Context()); err != nil || !res.AVCertChanged {
+			t.Fatalf("Reload = %+v, %v", res, err)
 		}
-		// 秘密鍵が証明書と対応していなければ差し替えない。
+		// 秘密鍵が証明書と対応していなければ差し替えない
 		_, otherKey, _ := certs.SelfSigned(certs.SelfSignedOptions{CommonName: "x", ValidFor: time.Hour})
-		if _, err := s.ReplaceAVCertificate(t.Context(), certPEM, otherKey); !errors.Is(err, certs.ErrInvalid) {
-			t.Errorf("mismatched key: err = %v, want certs.ErrInvalid", err)
+		fs.certs[store.CertSlotAV] = store.ServerCertificate{CertPEM: certPEM, KeyPEM: otherKey}
+		if _, err := s.Reload(t.Context()); err == nil {
+			t.Error("Reload with a mismatched key: want error")
 		}
+		fs.certs[store.CertSlotAV] = store.ServerCertificate{CertPEM: certPEM, KeyPEM: keyPEM}
 	})
 
 	cert, fp := clientCert(t, time.Hour)

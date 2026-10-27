@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,13 +44,24 @@ type Server struct {
 	store Store
 	log   *slog.Logger
 
-	// avCert は AV の mTLS リスナーが提示するサーバー証明書。再起動なしで差し替えられる。
+	// avCert は AV の mTLS リスナーが提示するサーバー証明書。SIGHUP で読み直す（Reload）。
 	avCert atomic.Pointer[tls.Certificate]
-	// adminCert は管理API のリスナーが提示するサーバー証明書。
-	adminCert *tls.Certificate
+	// adminCert は管理API のリスナーが提示するサーバー証明書。SIGHUP で読み直す。
+	adminCert atomic.Pointer[tls.Certificate]
+	// adminEnabled は管理API を起動するか（起動のときにピンのファイルがあったか）。
+	adminEnabled bool
+	// admin は管理クライアントのピンと、読み込んだ日時。SIGHUP で読み直す。
+	admin atomic.Pointer[adminClients]
+}
+
+type adminClients struct {
+	clients  config.AdminClients
+	loadedAt time.Time
 }
 
 // New はサーバーを作る。サーバー証明書がまだなければ自己署名を生成して保存する。
+// 管理クライアントのピンのファイル（cfg.AdminClientsFile）がなければ管理API を起動しない。
+// ファイルがあって形が違えば起動しない（設計概要 §10.1、確認事項 E2）。
 func New(ctx context.Context, cfg config.Config, st Store, log *slog.Logger) (*Server, error) {
 	s := &Server{cfg: cfg, store: st, log: log}
 
@@ -58,16 +71,102 @@ func New(ctx context.Context, cfg config.Config, st Store, log *slog.Logger) (*S
 	}
 	s.avCert.Store(cert)
 
-	if s.AdminEnabled() {
-		if s.adminCert, err = s.loadCertificate(ctx, store.CertSlotAdmin, cfg.AdminTLSHosts); err != nil {
+	clients, err := config.LoadAdminClients(cfg.AdminClientsFile)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		log.Info("admin api is disabled: the admin clients file does not exist", "event_id", "ADMIN_API_DISABLED", "file", cfg.AdminClientsFile)
+	case err != nil:
+		return nil, fmt.Errorf("admin clients: %w", err)
+	default:
+		s.adminEnabled = true
+		s.admin.Store(&adminClients{clients: clients, loadedAt: time.Now().UTC()})
+		log.Info("loaded admin clients", "event_id", "ADMIN_CLIENTS_LOADED", "names", clients.Names(), "count", len(clients))
+		adminCert, err := s.loadCertificate(ctx, store.CertSlotAdmin, cfg.AdminTLSHosts)
+		if err != nil {
 			return nil, err
 		}
+		s.adminCert.Store(adminCert)
 	}
 	return s, nil
 }
 
-// AdminEnabled は管理API を起動するかを返す。管理クライアントが 1 つも設定されていなければ起動しない。
-func (s *Server) AdminEnabled() bool { return len(s.cfg.AdminClients) > 0 }
+// AdminEnabled は管理API を起動するかを返す。
+func (s *Server) AdminEnabled() bool { return s.adminEnabled }
+
+// AdminClients は管理クライアントの識別名と、ピンを読み込んだ日時を返す（管理API の /status 用）。
+func (s *Server) AdminClients() (names []string, loadedAt time.Time) {
+	a := s.admin.Load()
+	if a == nil {
+		return nil, time.Time{}
+	}
+	return a.clients.Names(), a.loadedAt
+}
+
+// CertificateNotAfter は、提示しているサーバー証明書の期限を返す（管理API を起動していなければ管理用は零値）。
+func (s *Server) CertificateNotAfter() (av, admin time.Time) {
+	if c := s.avCert.Load(); c != nil {
+		av = c.Leaf.NotAfter
+	}
+	if c := s.adminCert.Load(); c != nil {
+		admin = c.Leaf.NotAfter
+	}
+	return av, admin
+}
+
+// ReloadResult は Reload の結果。
+type ReloadResult struct {
+	// AdminClients は読み直した管理クライアントの識別名（管理API を起動していない、または失敗なら nil）。
+	AdminClients []string
+	// AVCertChanged・AdminCertChanged は、提示するサーバー証明書が変わったか。
+	AVCertChanged, AdminCertChanged bool
+}
+
+// Reload は、管理クライアントのピンのファイルと、AV 用・管理用のサーバー証明書（Valkey）を読み直す（SIGHUP。確認事項 E1）。
+// 読めない・形が違うものは前のまま続け、エラーをまとめて返す。
+// AV クライアントの変更は、ハンドシェイクと要求ごとに Valkey を見るので、読み直しは要らない。
+func (s *Server) Reload(ctx context.Context) (ReloadResult, error) {
+	var res ReloadResult
+	var errs []error
+	if s.adminEnabled {
+		clients, err := config.LoadAdminClients(s.cfg.AdminClientsFile)
+		if err != nil {
+			s.log.Error("failed to reload admin clients (keeping the previous ones)", "event_id", "ADMIN_CLIENTS_RELOAD_ERR", "error", err)
+			errs = append(errs, err)
+		} else {
+			s.admin.Store(&adminClients{clients: clients, loadedAt: time.Now().UTC()})
+			res.AdminClients = clients.Names()
+			s.log.Info("reloaded admin clients", "event_id", "ADMIN_CLIENTS_RELOADED", "names", res.AdminClients, "count", len(clients))
+		}
+	}
+	var err error
+	if res.AVCertChanged, err = s.reloadCertificate(ctx, store.CertSlotAV, &s.avCert); err != nil {
+		errs = append(errs, err)
+	}
+	if s.adminEnabled {
+		if res.AdminCertChanged, err = s.reloadCertificate(ctx, store.CertSlotAdmin, &s.adminCert); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return res, errors.Join(errs...)
+}
+
+// reloadCertificate は Valkey のサーバー証明書を読み直して差し替える。変わったかを返す。
+func (s *Server) reloadCertificate(ctx context.Context, slot store.CertSlot, cur *atomic.Pointer[tls.Certificate]) (bool, error) {
+	sc, err := s.store.ServerCertificate(ctx, slot)
+	if err == nil {
+		var cert tls.Certificate
+		if cert, err = tls.X509KeyPair(sc.CertPEM, sc.KeyPEM); err == nil {
+			old := cur.Load()
+			changed := old == nil || !bytes.Equal(old.Certificate[0], cert.Certificate[0])
+			cur.Store(&cert)
+			s.log.Info("reloaded server certificate", "event_id", "SERVER_CERT_RELOADED", "slot", string(slot), "changed", changed,
+				"source", sc.Source, "fingerprint", certs.Fingerprint(cert.Leaf), "not_after", cert.Leaf.NotAfter)
+			return changed, nil
+		}
+	}
+	s.log.Error("failed to reload server certificate (keeping the previous one)", "event_id", "SERVER_CERT_RELOAD_ERR", "slot", string(slot), "error", err)
+	return false, fmt.Errorf("server certificate %s: %w", slot, err)
+}
 
 // loadCertificate は保存済みのサーバー証明書を読む。なければ自己署名を生成して保存する。
 func (s *Server) loadCertificate(ctx context.Context, slot store.CertSlot, hosts []string) (*tls.Certificate, error) {
@@ -82,7 +181,7 @@ func (s *Server) loadCertificate(ctx context.Context, slot store.CertSlot, hosts
 			return nil, err
 		}
 		if created {
-			s.log.Info("generated self-signed server certificate", "slot", string(slot), "hosts", hosts)
+			s.log.Info("generated self-signed server certificate", "event_id", "SERVER_CERT_GENERATED", "slot", string(slot), "hosts", hosts)
 		}
 		// 他のプロセスが先に保存していた場合に備えて、保存済みのものを読み直す。
 		sc, err = s.store.ServerCertificate(ctx, slot)
@@ -97,7 +196,7 @@ func (s *Server) loadCertificate(ctx context.Context, slot store.CertSlot, hosts
 	if err != nil {
 		return nil, fmt.Errorf("stored server certificate %s is invalid: %w", slot, err)
 	}
-	s.log.Info("loaded server certificate", "slot", string(slot),
+	s.log.Info("loaded server certificate", "event_id", "SERVER_CERT_LOADED", "slot", string(slot),
 		"source", sc.Source, "fingerprint", certs.Fingerprint(cert.Leaf), "not_after", cert.Leaf.NotAfter)
 	return &cert, nil
 }
@@ -114,42 +213,10 @@ func selfSigned(hosts []string) (certPEM, keyPEM []byte, err error) {
 	return certPEM, keyPEM, nil
 }
 
-// ---- AV 用サーバー証明書の管理（管理API から使う） ----
+// ---- AV 用サーバー証明書（管理API の読み出しの口から使う） ----
 
 // AVCertificate は現在の AV 用サーバー証明書を返す。
 func (s *Server) AVCertificate(ctx context.Context) (store.ServerCertificate, error) {
-	return s.store.ServerCertificate(ctx, store.CertSlotAV)
-}
-
-// ReplaceAVCertificate は AV 用サーバー証明書を持ち込みのものに差し替える。
-// 以後の新しい接続から反映される。内容が不正なら certs.ErrInvalid を返す。
-func (s *Server) ReplaceAVCertificate(ctx context.Context, certPEM, keyPEM []byte) (store.ServerCertificate, error) {
-	return s.setAVCertificate(ctx, certPEM, keyPEM, store.CertSourceUploaded)
-}
-
-// ResetAVCertificate は自己署名証明書を再生成し、AV 用サーバー証明書を置き換える。
-func (s *Server) ResetAVCertificate(ctx context.Context) (store.ServerCertificate, error) {
-	certPEM, keyPEM, err := selfSigned(s.cfg.AVTLSHosts)
-	if err != nil {
-		return store.ServerCertificate{}, err
-	}
-	return s.setAVCertificate(ctx, certPEM, keyPEM, store.CertSourceSelfSigned)
-}
-
-func (s *Server) setAVCertificate(ctx context.Context, certPEM, keyPEM []byte, source string) (store.ServerCertificate, error) {
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return store.ServerCertificate{}, fmt.Errorf("%w: %v", certs.ErrInvalid, err)
-	}
-	if err := certs.CheckValidity(cert.Leaf); err != nil {
-		return store.ServerCertificate{}, err
-	}
-	if err := s.store.SetServerCertificate(ctx, store.CertSlotAV, certPEM, keyPEM, source); err != nil {
-		return store.ServerCertificate{}, err
-	}
-	s.avCert.Store(&cert)
-	s.log.Info("replaced av server certificate",
-		"source", source, "fingerprint", certs.Fingerprint(cert.Leaf), "not_after", cert.Leaf.NotAfter)
 	return s.store.ServerCertificate(ctx, store.CertSlotAV)
 }
 
@@ -177,7 +244,7 @@ func (s *Server) verifyAVClient(cs tls.ConnectionState) error {
 	fp := certs.Fingerprint(cert)
 
 	if err := certs.CheckValidity(cert); err != nil {
-		s.log.Warn("client certificate rejected", "reason", "outside validity period", "fingerprint", fp)
+		s.log.Warn("client certificate rejected", "event_id", "AV_CLIENT_REJECTED", "reason", "outside validity period", "fingerprint", fp)
 		return errors.New("client certificate is outside its validity period")
 	}
 
@@ -186,13 +253,13 @@ func (s *Server) verifyAVClient(cs tls.ConnectionState) error {
 	c, err := s.store.ClientByFingerprint(ctx, fp)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		s.log.Warn("client certificate rejected", "reason", "not registered", "fingerprint", fp)
+		s.log.Warn("client certificate rejected", "event_id", "AV_CLIENT_REJECTED", "reason", "not registered", "fingerprint", fp)
 		return errors.New("client certificate is not registered")
 	case err != nil:
-		s.log.Error("client lookup failed", "error", err)
+		s.log.Error("client lookup failed", "event_id", "AV_CLIENT_LOOKUP_ERR", "error", err)
 		return errors.New("client lookup failed")
 	case !c.Enabled:
-		s.log.Warn("client certificate rejected", "reason", "client disabled", "client_id", c.ID)
+		s.log.Warn("client certificate rejected", "event_id", "AV_CLIENT_REJECTED", "reason", "client disabled", "client_id", c.ID)
 		return errors.New("client is disabled")
 	}
 	return nil
@@ -206,7 +273,7 @@ type clientIDKey struct{}
 func (s *Server) identifyAVClient(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-			s.log.Warn("av request rejected", "listener", "av-mtls", "reason", avapi.ReasonClientUnknown, "remote", r.RemoteAddr)
+			s.log.Warn("av request rejected", "event_id", "AV_REJECTED", "listener", "av-mtls", "reason", avapi.ReasonClientUnknown, "remote", r.RemoteAddr)
 			avapi.WriteRejected(w)
 			return
 		}
@@ -214,11 +281,11 @@ func (s *Server) identifyAVClient(next http.Handler) http.Handler {
 		switch {
 		case errors.Is(err, store.ErrNotFound):
 			// ハンドシェイクの後に削除されたクライアント。一般的な拒否にする（契約 §9.2）。
-			s.log.Warn("av request rejected", "listener", "av-mtls", "reason", avapi.ReasonClientUnknown, "remote", r.RemoteAddr)
+			s.log.Warn("av request rejected", "event_id", "AV_REJECTED", "listener", "av-mtls", "reason", avapi.ReasonClientUnknown, "remote", r.RemoteAddr)
 			avapi.WriteRejected(w)
 			return
 		case err != nil:
-			s.log.Error("client lookup failed", "error", err)
+			s.log.Error("client lookup failed", "event_id", "AV_CLIENT_LOOKUP_ERR", "error", err)
 			avapi.WriteInternalError(w)
 			return
 		}
@@ -234,24 +301,26 @@ func clientIDFromContext(r *http.Request) int64 {
 // ---- 管理API のリスナー ----
 
 // adminTLSConfig は管理API のリスナーの TLS 設定を返す。
-// クライアント証明書は、静的に設定された管理クライアントのフィンガープリントと照合する。
+// クライアント証明書は、ピンのファイルの管理クライアントのフィンガープリントと照合する（SIGHUP で読み直す）。
 func (s *Server) adminTLSConfig() *tls.Config {
 	return &tls.Config{
-		MinVersion:   tls.VersionTLS12,
-		ClientAuth:   tls.RequireAnyClientCert,
-		Certificates: []tls.Certificate{*s.adminCert},
+		MinVersion: tls.VersionTLS12,
+		ClientAuth: tls.RequireAnyClientCert,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return s.adminCert.Load(), nil
+		},
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
 				return errors.New("client certificate required")
 			}
 			cert := cs.PeerCertificates[0]
 			fp := certs.Fingerprint(cert)
-			if _, ok := s.cfg.AdminClients[fp]; !ok {
-				s.log.Warn("admin client certificate rejected", "reason", "not configured", "fingerprint", fp)
+			if _, ok := s.admin.Load().clients[fp]; !ok {
+				s.log.Warn("admin client certificate rejected", "event_id", "ADMIN_CLIENT_REJECTED", "reason", "not configured", "fingerprint", fp)
 				return errors.New("client certificate is not a configured admin client")
 			}
 			if err := certs.CheckValidity(cert); err != nil {
-				s.log.Warn("admin client certificate rejected", "reason", "outside validity period", "fingerprint", fp)
+				s.log.Warn("admin client certificate rejected", "event_id", "ADMIN_CLIENT_REJECTED", "reason", "outside validity period", "fingerprint", fp)
 				return errors.New("client certificate is outside its validity period")
 			}
 			return nil
@@ -264,7 +333,11 @@ func (s *Server) AdminClientName(r *http.Request) string {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 		return ""
 	}
-	return s.cfg.AdminClients[certs.Fingerprint(r.TLS.PeerCertificates[0])]
+	a := s.admin.Load()
+	if a == nil {
+		return ""
+	}
+	return a.clients[certs.Fingerprint(r.TLS.PeerCertificates[0])]
 }
 
 // ---- 起動 ----
@@ -312,8 +385,6 @@ func (s *Server) listen(admin http.Handler) (listeners []listener, err error) {
 			return listeners, fmt.Errorf("listen admin %s: %w", s.cfg.AdminAddr, err)
 		}
 		listeners = append(listeners, listener{"admin", s.httpServer(admin), ln})
-	} else {
-		s.log.Info("admin api is disabled: no admin clients are configured")
 	}
 	return listeners, nil
 }
@@ -329,7 +400,7 @@ func (s *Server) Run(ctx context.Context, admin http.Handler) error {
 	errc := make(chan error, len(listeners))
 	var wg sync.WaitGroup
 	for _, l := range listeners {
-		s.log.Info("listening", "listener", l.name, "addr", l.ln.Addr().String())
+		s.log.Info("listening", "event_id", "LISTENING", "listener", l.name, "addr", l.ln.Addr().String())
 		wg.Go(func() {
 			if err := l.srv.Serve(l.ln); !errors.Is(err, http.ErrServerClosed) {
 				errc <- fmt.Errorf("%s: %w", l.name, err)
@@ -340,7 +411,7 @@ func (s *Server) Run(ctx context.Context, admin http.Handler) error {
 	var runErr error
 	select {
 	case <-ctx.Done():
-		s.log.Info("shutting down")
+		s.log.Info("shutting down", "event_id", "SHUTDOWN")
 	case runErr = <-errc:
 	}
 
@@ -348,7 +419,7 @@ func (s *Server) Run(ctx context.Context, admin http.Handler) error {
 	defer cancel()
 	for _, l := range listeners {
 		if err := l.srv.Shutdown(shutdownCtx); err != nil {
-			s.log.Warn("shutdown", "listener", l.name, "error", err)
+			s.log.Warn("shutdown", "event_id", "SHUTDOWN_ERR", "listener", l.name, "error", err)
 		}
 	}
 	wg.Wait()

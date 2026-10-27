@@ -139,7 +139,7 @@ func (s *Store) checkClientsExist(ctx context.Context, ids []int64) error {
 
 // GetSubscriber は加入者を返す。Ki と OPc は含めない（SubscriberKeys で読む）。
 func (s *Store) GetSubscriber(ctx context.Context, imsi string) (Subscriber, error) {
-	subs, err := s.getSubscribers(ctx, []string{imsi})
+	subs, err := s.GetSubscribers(ctx, []string{imsi})
 	if err != nil {
 		return Subscriber{}, err
 	}
@@ -149,8 +149,8 @@ func (s *Store) GetSubscriber(ctx context.Context, imsi string) (Subscriber, err
 	return subs[0], nil
 }
 
-// getSubscribers は指定した IMSI の加入者を 1 回のパイプラインで読む。存在しないものは結果に含めない。
-func (s *Store) getSubscribers(ctx context.Context, imsis []string) ([]Subscriber, error) {
+// GetSubscribers は指定した IMSI の加入者を 1 回のパイプラインで読む（鍵は含めない）。存在しないものは結果に含めない。
+func (s *Store) GetSubscribers(ctx context.Context, imsis []string) ([]Subscriber, error) {
 	cmds := make(valkey.Commands, 0, 2*len(imsis))
 	for _, imsi := range imsis {
 		cmds = append(cmds,
@@ -424,7 +424,7 @@ func (s *Store) ListSubscribers(ctx context.Context, prefix, cursor string, limi
 		page.NextCursor = imsis[limit-1]
 	}
 	// 一覧の取得後に削除された加入者は、ここで結果から抜ける。
-	if page.Items, err = s.getSubscribers(ctx, imsis); err != nil {
+	if page.Items, err = s.GetSubscribers(ctx, imsis); err != nil {
 		return SubscriberPage{}, err
 	}
 	return page, nil

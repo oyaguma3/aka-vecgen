@@ -174,7 +174,7 @@
 
 ### 8.5 段階 2-2 で決めたこと（2026-10-28。確認事項 D1〜D5）
 
-- D1: 2-1 までの平文の `ki`・`opc` の行は移し替えない。払い出しで読んだら 500 `SYSTEM_FAILURE` を返し、ログの `reason` に `subscriber_cred_invalid` を残す（aka-vecgen のログは `event_id` ではなく `reason` で理由を残す流儀なので、それに合わせた）。
+- D1: 2-1 までの平文の `ki`・`opc` の行は移し替えない。払い出しで読んだら 500 `SYSTEM_FAILURE` を返し、ログの `reason` に `subscriber_cred_invalid` を残す（2-3 で `event_id` を付け、`AV_FAILED` の `reason` になった。§13.1）。
 - D2: AV 用と管理用のサーバー証明書の秘密鍵も KEK で暗号化する（`cfg:av_tls`・`cfg:admin_tls` の `key_enc`・`key_kek`。AAD は `aka-vecgen/cert/<av|admin>`）。平文の `key_pem` の行は読まない（キーを消すと作り直す）。
 - D3・D4: §8.2、§8.3 のとおり。
 - D5: 検証機での性能の計測は aka-mvpset の `verify/avload/`。2-1（平文）と 2-2（暗号化）で差は見えず、p99 は 6〜77 ミリ秒（目安の 200 ミリ秒の内）。
@@ -229,6 +229,11 @@
 - 管理API のサーバー証明書は、もとの実装と同じく自己署名（`aka-vecgen admin-cert reset` で作り直す）。
 - `X-Operator-Id`（操作者）と `X-Trace-ID`（受け取るか採番し、応答で返す）は、もとの実装の管理API 0.2.0 と同じ。
 - エラーは ProblemDetails（`application/problem+json`）で、`cause` に理由の符号を入れる。`cause` は、もとの実装の管理API 0.2.0 にある誤りはその名前のまま（入力の誤りは `INVALID_MSG_FORMAT`・`MANDATORY_IE_MISSING`・`MANDATORY_IE_INCORRECT`・`OPTIONAL_IE_INCORRECT`、`USER_NOT_FOUND`、`SUBSCRIBER_ALREADY_EXISTS`、`CLIENT_NOT_FOUND`、`SYSTEM_FAILURE` など）とし、MVP で足す誤りだけ新しい名前にする（`SUBSCRIBER_ACTIVE`、`SUBSCRIBER_TERMINATED`、`STATE_TRANSITION_NOT_ALLOWED`。段階 2-3 で `KEY_EXPORT_DISABLED`）。名前を変える理由がなく、変えると口の変更が増えるだけなので（2026-10-27、段階 2-1）。
+- 段階 2-3 で決めたこと（2026-10-28。確認事項 E1〜E6）:
+  - E1: `SIGHUP` で、管理クライアントのピンのファイルと、AV 用・管理用のサーバー証明書（Valkey）をまとめて読み直す。読めないものは前のまま続ける。コマンドでサーバー証明書を変えたら、`docker compose kill -s HUP aka-vecgen` で反映する。AV クライアントの変更は、接続と要求ごとに Valkey を見るので読み直しは要らない。読み直しは監査ログに残す（操作 `reload`、操作者 `sighup`）。
+  - E2: ピンのファイルは 1 行に `識別名=フィンガープリント`（`#` の行と空行は無視、同じ識別名を 2 行まで書ける、同じフィンガープリントの重なりは誤り）。`VECGEN_ADMIN_CLIENTS`（環境変数）はなくした。ファイルがあれば（空でも）管理API を起動し、なければ起動しない。起動のときに形が違えば起動しない。
+  - E3・E5・E6: §13.2、§9.3、§12。契約の版は 1.0.0、管理API は 2.0.0。
+  - E4: ログに `event_id` を付けた（§13.1）。
 - `Idempotency-Key` は aka-vecgen では扱わない。再送の判定は aka-provisioner が行う（provisioner の設計概要 §9.2）。登録は「既にあれば 409 `SUBSCRIBER_EXISTS`」、削除は「なければ 404」なので、一括投入の「既にある」「ない IMSI は飛ばす」（概要 §10.3）はこの応答で数えられる。
 
 ### 10.2 口
@@ -300,7 +305,7 @@
 
 ### 13.1 ログ
 
-- JSON（`log/slog`）で標準出力に出す。`event_id` と `trace_id` を付ける（例: `AV_ISSUED`、`AV_REJECTED`（`reason` つき）、`AV_FAILED`、`ADMIN_REQUEST`、`ADMIN_CLIENTS_RELOADED`、`KEK_MISMATCH`）。
+- JSON（`log/slog`）で標準出力に出す。`event_id` と `trace_id` を付ける（例: `AV_ISSUED`、`AV_REJECTED`（`reason` つき）、`AV_FAILED`、`ADMIN_REQUEST`、`ADMIN_CLIENTS_RELOADED`、`KEK_MISMATCH`）。2-3 で付けた（E4）。ほかに `AV_CLIENT_REJECTED`、`ADMIN_CLIENT_REJECTED`、`SERVER_CERT_LOADED`・`SERVER_CERT_GENERATED`・`SERVER_CERT_RELOADED`、`ADMIN_API_DISABLED`、`AUDIT`・`AUDIT_WRITE_ERR`、`KEY_EXPORT_ENABLED`、`STARTING`、`LISTENING` など。
 - 認証ベクターの払い出しは、IMSI・クライアント ID・認証タイプ・再同期の有無・`trace_id` を残す。IMSI はマスクしない（決定事項 26）。
 - Ki・OPc・CK・IK・CK'・IK'・XRES・KEK はログに出さない。
 - 集め方は概要 §13 の仕組み（ノードで圧縮して 2 週間、監視用の PC が取りに行く）による。
@@ -309,6 +314,7 @@
 
 - 残すもの: 加入者の登録・変更・状態の変更・Terminated からの戻し・削除、鍵の読み出し、AV クライアントとサーバー証明書の操作（コマンド）、KEK の入れ替え、管理クライアントの読み直し。項目はもとの実装と同じ（日時、操作者、管理クライアント、操作、対象、変更の内容、`trace_id`）に、理由（状態の変更）を足す。
 - 置き場所は 2 つ: Valkey の Stream（件数の上限つき。管理API で見る）と、日ごとの追記だけのファイル（`VECGEN_AUDIT_DIR` の `audit-YYYYMMDD.jsonl`）。ファイルは日が変わったら圧縮し、監視用の PC が取りに行く（概要 §13。Stream から押し出される前に残すため。§17 の B9）。ノードでは 2 週間持つ。
+  - 2-3 で決めたこと（E3）: 日付は日本時間（+09:00 の固定）で区切る。圧縮（gzip）と、保存の日数（`VECGEN_AUDIT_RETENTION_DAYS`、既定 14）を過ぎたファイルの削除は、serve が起動のときと 1 時間ごとに行う（distroless のコンテナにはホストの logrotate が届かないため。前の日のファイルは、最後に書いてから 10 分たってから圧縮する）。ファイルの 1 行は `time`・`operator`・`mgmtClient`・`action`・`target`・`detail`・`traceId`・`streamId`（Stream のエントリID）。管理API とコマンドが同じファイルに追記する。書けなかったときは ERROR のログ（`AUDIT_WRITE_ERR`）を出し、操作は成功のまま返す。serve は、置き場所に書けなければ起動しない。compose ではホストの `audit/` を UID 65532 で書けるようにしてマウントする。
 - 一括投入の行ごとの操作は、`trace_id` にジョブの ID が入る（概要 §10.4）。
 
 ## 14. 配備
@@ -335,7 +341,7 @@
 | 1 | リポジトリ `aka-vecgen` を作り、aka-only-server の履歴ごと移す。改名だけ（module パス、コマンド、環境変数の接頭辞、Docker のネットワーク名、イメージ名、文書） | 今の CI が通る |
 | 2-1 | 状態と払い出しの Lua の変更、認証ベクターAPI を契約に合わせる（V1〜V6）、平文HTTP をなくす、管理API 2.0.0 の加入者の口（状態の変更と戻しを含む） | 単体・結合、適合試験。**済み（2026-10-27）**: 適合試験 11 項目すべて PASS |
 | 2-2 | 鍵の暗号化、KEK（起動の確認、`gen-kek`、`rotate-kek`） | 単体・結合、検証機での性能の軽い計測。**済み（2026-10-28）**: §8.5 |
-| 2-3 | 管理API 2.0.0 の残り（一括取得、鍵の口の既定の無効、AV クライアントと証明書の書き込みの口をコマンドへ、`/logs` をなくす）、ピンのファイルと `SIGHUP`、監査ログの書き出し | 結合 |
+| 2-3 | 管理API 2.0.0 の残り（一括取得、鍵の口の既定の無効、AV クライアントと証明書の書き込みの口をコマンドへ、`/logs` をなくす）、ピンのファイルと `SIGHUP`、監査ログの書き出し | 結合。**済み（2026-10-28）**: §10.1 の「段階 2-3 で決めたこと」 |
 | 2-4 | 運用ガイド（導入、KEK とバックアップ、SQN の方式の指針、鍵を誤ったときの登録し直し）、README | 手元の compose、simwifi で aka-radius から認証 |
 
 - 手順の組み替え（2026-10-27。aka-mvpset の概要 §18.5 の H2）: データの形と、それを読み書きする口は同じ手順で変える（状態と管理API の加入者の口を 2-1 にまとめた）。

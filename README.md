@@ -22,8 +22,8 @@
 | フェーズ | 内容 | 状態 |
 |---|---|---|
 | 1 | AKA コア、Valkey、認証ベクターAPI（mTLS。平文HTTP は MVP の段階 2-1 でなくした） | 実装済み |
-| 2 | 管理API | 実装済み |
-| 3 | BFF / Web GUI（web-gui-for-aka-only-server） | 実装済み |
+| 2 | 管理API 2.0.0（`/admin/v2`。呼び出し側は aka-provisioner） | 実装済み（MVP の段階 2-3） |
+| 3 | 鍵と証明書の秘密鍵の暗号化（KEK）、監査ログの日ごとのファイル | 実装済み（MVP の段階 2-2・2-3） |
 
 ## 起動
 
@@ -45,7 +45,15 @@ sudo chown 65532 secrets/kek && sudo chmod 600 secrets/kek
 
 （イメージを作った後なら `docker compose run --rm --no-deps -T aka-vecgen gen-kek > secrets/kek` でも作れます。イメージがまだないと、ビルドの経過が同じ出力に混じるので、先に `docker compose build` をします。作った後は同じく `chown` と `chmod` をします。）**KEK を失うと、全加入者の鍵を登録し直すことになります。** 作ったら、Valkey のバックアップとは別の場所（オフライン）にも写しを置いてください。
 
-起動します。
+管理クライアントのピンのファイル（下の「管理API」。空でもよい）と、監査ログの日ごとのファイルの置き場所（`audit/`）を作ります。どちらも UID 65532 で読み書きできるようにします。
+
+```bash
+touch secrets/admin-clients
+sudo chown 65532 secrets/admin-clients && sudo chmod 600 secrets/admin-clients
+mkdir -p audit && sudo chown 65532 audit && sudo chmod 750 audit
+```
+
+起動します（`audit/` に書けなければ起動しません）。
 
 ```bash
 docker compose up -d --build
@@ -103,22 +111,25 @@ curl --cacert server.pem --cert radius.pem -X POST https://localhost:8443/nudm-u
 
 ## 管理API
 
-加入者、AVクライアント、AV 用サーバー証明書、ログ、監査ログを操作する API です。管理クライアントを設定するまでは起動しません。
+加入者の登録・変更・状態の変更・削除・一括取得と、AV クライアント・AV 用サーバー証明書・監査ログの読み出しを行う API（2.0.0、`/admin/v2`）です。呼び出し側は aka-provisioner です。AV クライアントとサーバー証明書の登録・変更・削除は、管理API ではなくノードの上のコマンドで行います（下の「コマンド」）。鍵の読み出しの口は、既定で無効です（`VECGEN_KEY_EXPORT=true` のときだけ）。
 
-管理クライアント（BFF など）の証明書を用意し、フィンガープリントを調べます。
+管理クライアントは、ピンのファイル `secrets/admin-clients` に、1 行に 1 つ `識別名=フィンガープリント` の形で書きます（`#` で始まる行と空行は無視します）。証明書を入れ替える間は、同じ識別名を新旧 2 行書けます。ファイルがあれば（空でも）管理API を起動し、書いた管理クライアントだけを通します。
+
+管理クライアントの証明書を用意し、フィンガープリントを調べます。
 
 ```bash
-docker compose run --rm --no-deps -T aka-vecgen client gen-cert -name bff > bff.pem
+docker compose run --rm --no-deps -T aka-vecgen client gen-cert -name prov > prov.pem
 ```
 
 ```bash
-docker compose run --rm --no-deps -T aka-vecgen fingerprint < bff.pem
+docker compose run --rm --no-deps -T aka-vecgen fingerprint < prov.pem
 ```
 
-`.env` の `VECGEN_ADMIN_CLIENTS` に `識別名=フィンガープリント` の形で設定し、起動し直します。
+ピンのファイルに書き、動いているサーバーに読み直させます（再起動は要りません）。
 
 ```bash
-docker compose up -d
+echo "prov=<フィンガープリント>" | sudo tee -a secrets/admin-clients > /dev/null
+docker compose kill -s HUP aka-vecgen
 ```
 
 管理API 用のサーバー証明書を取り出して、接続を確認します。
@@ -128,7 +139,7 @@ docker compose exec -T aka-vecgen /aka-vecgen admin-cert > admin.pem
 ```
 
 ```bash
-curl --cacert admin.pem --cert bff.pem https://localhost:9443/admin/v2/status
+curl --cacert admin.pem --cert prov.pem https://localhost:9443/admin/v2/status
 ```
 
 操作の一覧は [docs/openapi/admin-api.yaml](docs/openapi/admin-api.yaml)、設定と運用の詳細は [docs/operation-guide.md](docs/operation-guide.md) を参照してください。
@@ -141,14 +152,24 @@ curl --cacert admin.pem --cert bff.pem https://localhost:9443/admin/v2/status
 | `gen-kek` | KEK を作る。`-out` を省くと標準出力に書く。ファイルは権限 600 で作り、上書きしない |
 | `rotate-kek -old <ファイル> -new <ファイル>` | 加入者の鍵とサーバー証明書の秘密鍵を新しい KEK で暗号化し直す（下の「KEK の入れ替え」） |
 | `subscriber add` / `show` / `del` | 加入者を登録・表示・削除する |
-| `client add` / `list` / `del` | AVクライアントを登録・一覧・削除する |
+| `client add` / `list` / `show` / `del` | AVクライアントを登録・一覧・表示・削除する |
+| `client update -id <ID>` | AVクライアントの表示名（`-name`）、有効と無効（`-enable` / `-disable`）、Network Name（`-network-name`）を変える |
+| `client replace-cert -id <ID>` | AVクライアントの証明書を差し替える（`-cert`、既定は標準入力） |
 | `client gen-cert` | クライアント用の自己署名証明書と秘密鍵を生成する |
-| `av-cert` | 認証ベクターAPI 用のサーバー証明書を表示する |
+| `av-cert` | 認証ベクターAPI 用のサーバー証明書を表示する。`av-cert replace -cert <PEM> -key <PEM>` で持ち込みの証明書に差し替え、`av-cert reset` で自己署名を作り直す |
 | `admin-cert` | 管理API 用のサーバー証明書を表示する。`admin-cert reset` で作り直す |
 | `fingerprint` | 標準入力の証明書（PEM）の SHA-256 フィンガープリントを表示する |
 | `healthcheck` | 動いているサーバーのリスナーに接続できるかを確かめる（compose の healthcheck が使う） |
 
 各コマンドのオプションは `-h` で確認できます。`subscriber add` の `-sqn-type` には SQN 増加タイプ（`inc1` / `inc32` / `inc33`）を指定します。
+
+- 登録・変更・削除のコマンドは、監査ログ（Valkey の Stream と `audit/` の日ごとのファイル）に残します。操作者は `-operator` で名前を付けられます（既定 `cli`）。
+- AV クライアントの変更（有効と無効、Network Name、証明書の差し替え、削除）は、すぐに効きます（接続と要求ごとに Valkey を見るため）。
+- サーバー証明書の差し替えと作り直し、ピンのファイルの変更は、`docker compose kill -s HUP aka-vecgen` で動いているサーバーに反映します。
+
+### 監査ログ
+
+管理API とコマンドの操作、KEK の入れ替え、`SIGHUP` での読み直しを、Valkey の Stream（`VECGEN_AUDIT_MAX` 件まで。管理API の `GET /admin/v2/audit-logs`）と、日ごとのファイル `audit/audit-YYYYMMDD.jsonl`（日本時間で区切る）に残します。前の日までのファイルは gzip で圧縮し、`VECGEN_AUDIT_RETENTION_DAYS`（既定 14 日）を過ぎたものは消します。ファイルは監視用の PC が取りに行きます。鍵の値は残しません。
 
 ### KEK の入れ替え
 
@@ -178,13 +199,15 @@ docker compose up -d --force-recreate aka-vecgen
 | `VECGEN_KEK_FILE` | `/run/secrets/kek` | KEK のファイル（compose では `secrets/kek` を Docker の secrets で渡す） |
 | `VECGEN_AV_TLS_PUBLISH` | `0.0.0.0:8443` | mTLS リスナーを公開するホスト側のアドレスとポート |
 | `VECGEN_AV_TLS_HOSTS` | `localhost,127.0.0.1,aka-vecgen` | AV 用の自己署名サーバー証明書の SAN。生成済みの証明書には反映されない |
-| `VECGEN_ADMIN_CLIENTS` | （空） | 管理クライアント。`識別名=フィンガープリント` のカンマ区切り。空なら管理API を起動しない |
+| `VECGEN_ADMIN_CLIENTS_FILE` | `/run/secrets/admin-clients` | 管理クライアントのピンのファイル（compose では `secrets/admin-clients`）。ファイルがなければ管理API を起動しない。`SIGHUP` で読み直す |
+| `VECGEN_KEY_EXPORT` | `false` | 鍵の読み出しの口を有効にする（別の生成源への移し替えのときだけ） |
 | `VECGEN_ADMIN_PUBLISH` | `127.0.0.1:9443` | 管理API を公開するホスト側のアドレスとポート |
 | `VECGEN_ADMIN_TLS_HOSTS` | `localhost,127.0.0.1,aka-vecgen` | 管理API 用の自己署名サーバー証明書の SAN。生成済みの証明書には反映されない |
 | `VECGEN_SHARED_NETWORK` | `aka-av` | 同一ホスト上の別の compose プロジェクトと共有する Docker ネットワークの名前 |
 | `VECGEN_LOG_LEVEL` | `info` | ログレベル |
-| `VECGEN_LOG_BUFFER` | `1000` | 管理API で返すためにメモリに保持するログの件数 |
-| `VECGEN_AUDIT_MAX` | `10000` | 監査ログの保持件数の上限 |
+| `VECGEN_AUDIT_MAX` | `100000` | 監査ログの Stream の保持件数の上限 |
+| `VECGEN_AUDIT_DIR` | `/data/audit` | 監査ログの日ごとのファイルの置き場所（compose では `audit/` をマウント） |
+| `VECGEN_AUDIT_RETENTION_DAYS` | `14` | 監査ログのファイルをノードで持つ日数 |
 | `VECGEN_VERSION` | `dev` | 起動ログと管理API の `/status` に出すバージョン（ビルドのときに埋め込む） |
 
 Docker が公開したポートは ufw の規則を通りません。公開範囲は `VECGEN_AV_TLS_PUBLISH`、`VECGEN_ADMIN_PUBLISH` のアドレスで制御してください。
@@ -213,11 +236,11 @@ GitHub Actions（`.github/workflows/ci.yml`）で、push と pull request のた
 |---|---|
 | テスト | gofmt の確認、`go vet`、race 検出つきのテスト（Valkey の結合テストを含む） |
 | イメージと compose の設定 | Docker イメージのビルドと compose の設定の検査 |
-| README の手順の通し確認 | この README の「起動」から「認証ベクターの取得」までを実行し、3 つの認証タイプでベクターを取得する。未登録のクライアントが接続できないことも確かめる |
+| README の手順の通し確認 | この README の「起動」から「認証ベクターの取得」までを実行し、3 つの認証タイプでベクターを取得する。AV 用サーバー証明書を作り直して `SIGHUP` で反映できること、操作が監査ログのファイルに残ること、未登録のクライアントが接続できないことも確かめる |
 
 依存と標準ライブラリの既知の脆弱性は、`.github/workflows/govulncheck.yml` が push と pull request のたびと、毎週月曜に govulncheck で調べます。
 
-管理API と BFF の契約は、[web-gui-for-aka-only-server](https://github.com/oyaguma3/web-gui-for-aka-only-server) の CI がこのリポジトリの main を相手に確かめます。
+管理API と aka-provisioner の契約の試験は、aka-provisioner を作り直す MVP の段階 3-1 で、aka-provisioner の CI がこのリポジトリの固定のコミットを相手に確かめます。
 
 ## ドキュメント
 

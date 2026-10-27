@@ -23,7 +23,8 @@ type AuditEntry struct {
 }
 
 // AppendAudit は監査ログを追記する。件数が maxLen を超えた分は古いものから捨てる。
-func (s *Store) AppendAudit(ctx context.Context, e AuditEntry, maxLen int64) error {
+// 戻り値は Stream のエントリID（日ごとのファイルにも書き、両方を突き合わせられるようにする）。
+func (s *Store) AppendAudit(ctx context.Context, e AuditEntry, maxLen int64) (string, error) {
 	cmd := s.c.B().Xadd().Key(keyAudit).Maxlen().Almost().Threshold(strconv.FormatInt(maxLen, 10)).Id("*").FieldValue().
 		FieldValue("operator", e.Operator).
 		FieldValue("mgmt_client", e.MgmtClient).
@@ -31,10 +32,11 @@ func (s *Store) AppendAudit(ctx context.Context, e AuditEntry, maxLen int64) err
 		FieldValue("target", e.Target).
 		FieldValue("detail", e.Detail).
 		FieldValue("trace_id", e.TraceID).Build()
-	if err := s.c.Do(ctx, cmd).Error(); err != nil {
-		return fmt.Errorf("append audit: %w", err)
+	id, err := s.c.Do(ctx, cmd).ToString()
+	if err != nil {
+		return "", fmt.Errorf("append audit: %w", err)
 	}
-	return nil
+	return id, nil
 }
 
 // ListAudit は監査ログを新しい順に返す。before が空でなければ、そのエントリID より古いものを返す。

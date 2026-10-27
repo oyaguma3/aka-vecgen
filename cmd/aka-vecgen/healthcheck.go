@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"time"
 
 	"github.com/oyaguma3/aka-vecgen/internal/config"
@@ -25,9 +26,10 @@ func healthcheckCommand(ctx context.Context) error {
 }
 
 // listenerAddrs は、設定から有効なリスナーの待ち受けアドレスを返す。
+// 管理API は、管理クライアントのピンのファイルがあるときだけ起動する（確認事項 E2）。
 func listenerAddrs(cfg config.Config) []string {
 	addrs := []string{cfg.AVTLSAddr}
-	if len(cfg.AdminClients) > 0 {
+	if _, err := os.Stat(cfg.AdminClientsFile); err == nil {
 		addrs = append(addrs, cfg.AdminAddr)
 	}
 	return addrs
