@@ -29,7 +29,7 @@ func subscriberCommand(ctx context.Context, args []string) error {
 
 	switch args[0] {
 	case "add":
-		ki := fs.String("ki", "", "Ki（16進 32 桁）")
+		ki := fs.String("ki", "", "Ki（16進 32 桁）。-ki と -opc を省くと、標準入力の 1 行（Ki OPc）から読む")
 		opc := fs.String("opc", "", "OPc（16進 32 桁）")
 		sqn := fs.String("sqn", "000000000000", "SQN の初期値（16進 12 桁）")
 		amf := fs.String("amf", "8000", "AMF（16進 4 桁）")
@@ -51,10 +51,7 @@ func subscriberCommand(ctx context.Context, args []string) error {
 			sub.State = store.StateInactive
 		}
 		var err error
-		if sub.Ki, err = hexBytes("-ki", *ki, 16); err != nil {
-			return err
-		}
-		if sub.OPc, err = hexBytes("-opc", *opc, 16); err != nil {
+		if sub.Ki, sub.OPc, err = subscriberKeys(os.Stdin, *ki, *opc); err != nil {
 			return err
 		}
 		sqnBytes, err := hexBytes("-sqn", *sqn, 6)
@@ -145,6 +142,34 @@ func subscriberCommand(ctx context.Context, args []string) error {
 		return nil
 	}
 	return fmt.Errorf("unknown subscriber command %q", args[0])
+}
+
+// subscriberKeys は Ki と OPc を引数か標準入力から読む。
+// 本物の鍵を引数に書くと、シェルの履歴とホストのプロセスの一覧に残るので、標準入力から渡せるようにする（設計概要 §12）。
+func subscriberKeys(stdin io.Reader, ki, opc string) ([]byte, []byte, error) {
+	switch {
+	case ki == "" && opc == "":
+		data, err := io.ReadAll(io.LimitReader(stdin, 1024))
+		if err != nil {
+			return nil, nil, err
+		}
+		fields := strings.Fields(string(data))
+		if len(fields) != 2 {
+			return nil, nil, errors.New("stdin must be one line: <Ki> <OPc>")
+		}
+		ki, opc = fields[0], fields[1]
+	case ki == "" || opc == "":
+		return nil, nil, errors.New("-ki and -opc must be given together (or both omitted to read from stdin)")
+	}
+	kiB, err := hexBytes("Ki", ki, 16)
+	if err != nil {
+		return nil, nil, err
+	}
+	opcB, err := hexBytes("OPc", opc, 16)
+	if err != nil {
+		return nil, nil, err
+	}
+	return kiB, opcB, nil
 }
 
 func fingerprintCommand() error {

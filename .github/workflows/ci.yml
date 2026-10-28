@@ -138,6 +138,24 @@ jobs:
             echo "未登録のクライアントが接続できてしまいました"
             exit 1
           fi
+      - name: Valkey のバックアップと戻し（運用ガイド 9 章）
+        run: |
+          mkdir -p backups
+          scripts/backup-valkey.sh backups/valkey.rdb
+          # 写しの後に、標準入力の鍵で加入者を足す（運用ガイド 5.4）。戻すと消える
+          echo "465b5ce8b199b49faa5f0a2ee238a6bc cd63cb71954a9f4e48a5994e37a02baf" |
+            docker compose exec -T aka-vecgen /aka-vecgen subscriber add -imsi 440100123456780 -clients 1
+          docker compose exec -T aka-vecgen /aka-vecgen subscriber show -imsi 440100123456780
+          scripts/restore-valkey.sh backups/valkey.rdb
+          docker compose up -d --wait --wait-timeout 120
+          if docker compose exec -T aka-vecgen /aka-vecgen subscriber show -imsi 440100123456780; then
+            echo "写しの後に足した加入者が残っています"
+            exit 1
+          fi
+          # 写しの前の加入者は戻り、払い出せる
+          curl -sS --fail-with-body --retry 10 --retry-delay 2 --retry-all-errors --cacert server-new.pem --cert radius.pem -X POST \
+            https://localhost:8443/nudm-ueau/v1/imsi-440100123456789/hss-security-information/eap-aka/generate-av \
+            -d '{"hssAuthType":"EAP_AKA","numOfRequestedVectors":1}' | jq -e '.hssAuthenticationVectors | length == 1'
       - name: ログ（失敗時）
         if: failure()
         run: docker compose logs --no-color
@@ -158,7 +176,7 @@ jobs:
           --health-retries 10
     env:
       # 適合試験（aka-mvpset の conformance/av-api）のコミット。契約や適合試験を変えたら、その main のコミットに更新する。
-      MVPSET_REF: 3477e863b52b65a851cd453d08b180b1bba83208
+      MVPSET_REF: 2702966a38c72d1e2a3675277a9e59035a762293
       VECGEN_VALKEY_ADDR: localhost:6379
       VECGEN_AV_TLS_ADDR: 127.0.0.1:18443
       VECGEN_AV_TLS_HOSTS: localhost,127.0.0.1

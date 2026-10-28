@@ -1,13 +1,14 @@
-# aka-vecgen 設計概要（下書き）
+# aka-vecgen 設計概要
 
 - 作成日: 2026-10-25
-- 状態: 下書き。§17 の確認事項は 2026-10-25 にすべて推奨案で合意した（§3.2 の決定事項 1〜11）。
+- 状態: §17 の確認事項は 2026-10-25 にすべて推奨案で合意した（§3.2 の決定事項 1〜11）。MVP セットの段階 2（2-1〜2-4）の改修を 2026-10-28 に終えた（§16）。
 - 置き場所: 2026-10-27（MVP セットの段階 1）に、aka-mvpset の `docs/nodes/aka-vecgen.md` から本リポジトリの `docs/design-overview.md` に移した。
 - 対象: 認証ベクターを作るノード aka-vecgen（もとは aka-only-server。以下「もとの実装」）。
 - 関連:
   - aka-mvpset の[要件と構成の概要](https://github.com/oyaguma3/aka-mvpset/blob/main/docs/requirements-overview.md)（以下「概要」）: §5（配置）、§6.1・§6.3・§6.4（加入者のデータ・状態・台帳）、§10（一括投入）、§11（権限）、§12（鍵と秘密の値）、§13（ログ）、§15（バックアップ）、§17.1（改修）
   - 認証ベクターAPI の契約（以下「契約」）: [av-api-contract.md](https://github.com/oyaguma3/aka-mvpset/blob/main/docs/av-api-contract.md)。とくに §16.1（aka-vecgen の改修 V1〜V7）
-  - もとの実装: aka-only-server。今の作りは本リポジトリの [`docs/poc/design-overview.md`](poc/design-overview.md)、[`docs/data-model.md`](data-model.md)、`docs/openapi/admin-api.yaml`（管理API 0.2.0）
+  - もとの実装: aka-only-server（`c2a093d`、`pocset-v1.0.1`）の[設計概要](https://github.com/oyaguma3/aka-only-server/blob/c2a093d0c336be039cd00f74631be5f1de4d4300/docs/design-overview.md)（以下「もとの実装の設計概要」）、[データモデル](https://github.com/oyaguma3/aka-only-server/blob/c2a093d0c336be039cd00f74631be5f1de4d4300/docs/data-model.md)（以下「もとの実装のデータモデル」）、[管理API 0.2.0](https://github.com/oyaguma3/aka-only-server/blob/c2a093d0c336be039cd00f74631be5f1de4d4300/docs/openapi/admin-api.yaml)。本リポジトリの今の作りは [`docs/data-model.md`](data-model.md)、`docs/openapi/admin-api.yaml`（管理API 2.0.0）、[運用ガイド](operation-guide.md)
+  - 本リポジトリにあったもとの実装の設計概要の写し（`docs/poc/design-overview.md`）は、段階 2-4 で消した（中身は上のリンクと同じ）
   - 手本にする実装: radsec-ca（KEK と鍵の暗号化 §6、管理クライアントのピン §9.1）、eapaka-node-provisioner（管理クライアントの認証、操作者・トレースID）
 
 ## 1. 位置づけ
@@ -115,7 +116,7 @@
 
 ### 6.4 SQN の方式の指針
 
-運用ガイドに次の指針を書く（概要 §6.1）。
+運用ガイド（§5.2）に次の指針を書く（概要 §6.1）。
 
 | 方式 | 使いどころ |
 |---|---|
@@ -164,7 +165,7 @@
   - 「止めてから」を仕組みで確かめる（D3）: `serve` は 10 秒ごとに `cfg:serve:alive`（TTL 30 秒、止まるときに消す）を書き、`rotate-kek` はそれがあれば断る。入れ替えの間は `cfg:kek_rotation`（古い識別子:新しい識別子）を立て、終わったら `cfg:kek` と `cfg:kek_check` を新しい KEK にして消す。違う組の KEK でのやり直しは断る。
   - KEK のファイルはコンテナに 1 つのファイルとして渡すので、`mv` で置き換えたら、コンテナを作り直す（`docker compose up -d --force-recreate`）。作り直さないと、古いファイルを見たままになる（2-2 の試しで分かった）。
 - `aka-vecgen gen-kek -out <ファイル>`: KEK を作る（ファイルは radsec-ca と同じく 16 進の 64 文字。`-out` を省くと標準出力）。
-- バックアップは Valkey の AOF と定期のスナップショット（概要 §15）。暗号文なので、KEK と一緒に置かない。**KEK を失うと全加入者の鍵を入れ直すことになる**（運用ガイドに書く）。
+- バックアップは Valkey の AOF と定期のスナップショット（概要 §15）。暗号文なので、KEK と一緒に置かない。**KEK を失うと全加入者の鍵を入れ直すことになる**（運用ガイド §9.1）。
 
 ### 8.4 鍵の書き込みと読み出し
 
@@ -289,7 +290,7 @@
 |---|---|---|
 | `VECGEN_VALKEY_ADDR` / `VECGEN_VALKEY_PASSWORD` | Valkey | — |
 | `VECGEN_KEK_FILE` | KEK のファイル | `/run/secrets/kek` |
-| `VECGEN_AV_ADDR` / `VECGEN_AV_TLS_HOSTS` | 認証ベクターAPI の待ち受けとサーバー証明書の SAN | `:8443` / — |
+| `VECGEN_AV_TLS_ADDR` / `VECGEN_AV_TLS_HOSTS` | 認証ベクターAPI の待ち受けとサーバー証明書の SAN | `:8443` / — |
 | `VECGEN_ADMIN_ADDR` / `VECGEN_ADMIN_TLS_HOSTS` | 管理API の待ち受けとサーバー証明書の SAN | `:9443` / — |
 | `VECGEN_ADMIN_CLIENTS_FILE` | 管理クライアントのピンのファイル | `/run/secrets/admin-clients` |
 | `VECGEN_KEY_EXPORT` | 鍵の読み出しの API を有効にする | `false` |
@@ -297,7 +298,7 @@
 | `VECGEN_AUDIT_DIR` | 監査ログの書き出し先（§13.2） | `/data/audit` |
 | `VECGEN_LOG_LEVEL` | ログの段階 | `INFO` |
 
-コマンド: `aka-vecgen serve`（既定）、`gen-kek`、`rotate-kek`、`client`（AV クライアントの登録・証明書の差し替え・有効と無効・ネットワーク名・削除）、`av-cert`、`admin-cert`、`fingerprint`、`subscriber`（試験と初めの確認のための個別の操作。鍵を標準入力から受ける）、`healthcheck`。
+コマンド: `aka-vecgen serve`（既定）、`gen-kek`、`rotate-kek`、`client`（AV クライアントの登録・証明書の差し替え・有効と無効・ネットワーク名・削除）、`av-cert`、`admin-cert`、`fingerprint`、`subscriber`（試験と初めの確認のための個別の操作。鍵は、`-ki`・`-opc` を省くと標準入力の 1 行から受ける。段階 2-4 の F8）、`healthcheck`。
 
 - コマンドは `docker compose exec` で、動いているコンテナの中で使う（Valkey と KEK に届くため）。使ったことは監査ログに残す（操作者は `cli`）。
 
@@ -323,6 +324,7 @@
 - aka-radius と共有する Docker のネットワーク（external）に、aka-vecgen の認証ベクターAPI だけを出す。Valkey は出さない。
 - 管理API はサービス用の WireGuard のアドレスにだけ結び付ける（`ports` のバインド先と nftables の `DOCKER-USER`。概要 §5.3）。
 - KEK と管理クライアントのピンのファイルは Docker の secrets で渡す。ピンのファイルを書き換えたら `docker compose kill -s HUP aka-vecgen` で読み直す。
+- Valkey のバックアップと戻しは `scripts/backup-valkey.sh`・`scripts/restore-valkey.sh`（運用ガイド §9）。
 - healthcheck は、もとの実装と同じく待ち受けに TCP でつなげるかを確かめる。
 
 ## 15. 試験
@@ -342,11 +344,22 @@
 | 2-1 | 状態と払い出しの Lua の変更、認証ベクターAPI を契約に合わせる（V1〜V6）、平文HTTP をなくす、管理API 2.0.0 の加入者の口（状態の変更と戻しを含む） | 単体・結合、適合試験。**済み（2026-10-27）**: 適合試験 11 項目すべて PASS |
 | 2-2 | 鍵の暗号化、KEK（起動の確認、`gen-kek`、`rotate-kek`） | 単体・結合、検証機での性能の軽い計測。**済み（2026-10-28）**: §8.5 |
 | 2-3 | 管理API 2.0.0 の残り（一括取得、鍵の口の既定の無効、AV クライアントと証明書の書き込みの口をコマンドへ、`/logs` をなくす）、ピンのファイルと `SIGHUP`、監査ログの書き出し | 結合。**済み（2026-10-28）**: §10.1 の「段階 2-3 で決めたこと」 |
-| 2-4 | 運用ガイド（導入、KEK とバックアップ、SQN の方式の指針、鍵を誤ったときの登録し直し）、README | 手元の compose、simwifi で aka-radius から認証 |
+| 2-4 | 運用ガイド（導入、KEK とバックアップ、SQN の方式の指針、鍵を誤ったときの登録し直し）、README | 手元の compose、検証機で aka-radius から認証。**済み（2026-10-28）**: 下の「段階 2-4 で決めたこと」 |
 
 - 手順の組み替え（2026-10-27。aka-mvpset の概要 §18.5 の H2）: データの形と、それを読み書きする口は同じ手順で変える（状態と管理API の加入者の口を 2-1 にまとめた）。
 - 2-1 は aka-mvpset の適合試験を先に作ってから行い、その後に aka-radius の 2-1・2-2 で通しを確かめる（概要 §18.5 の H1）。
 - aka-provisioner との契約の試験は、aka-provisioner を作り直す段階 3-1 で行う（概要 §18.5 の H4）。
+
+段階 2-4 で決めたこと（2026-10-28。確認事項 F1〜F8 はすべて推奨案で合意）:
+
+- F1: もとの実装の設計概要の写し（`docs/poc/design-overview.md`）を消し、参照は aka-only-server の固定のコミット（`c2a093d`）の文書へのリンクにした。
+- F2・F3: README は概要・起動・最初の登録と取得・管理API・コマンド・設定・開発に絞り、運用（aka-radius とのつなぎ方、管理クライアント、加入者、証明書、公開範囲、ログと監査ログ、KEK とバックアップ、KEK の入れ替え、更新、障害時の確かめ）は運用ガイドに書いた。
+- F4: `VECGEN_AV_TLS_PUBLISH` の既定を `127.0.0.1:8443` にした（§14。aka-radius は共有ネットワークでつなぐ）。
+- F5: 管理API の待ち受けは運用ガイドに原則（WireGuard のアドレスと `DOCKER-USER`）だけを書き、nftables の規則は段階 5 の配置の文書で決める。
+- F6: Fluent Bit への重ね合わせ（`logging: fluentd`）と、aka-radius の Fluent Bit の出力先は、aka-radius の段階 2-5 で両方を足す。
+- F7: Valkey のバックアップは止めずに `BGSAVE` で取る（`scripts/backup-valkey.sh`）。AOF が有効な Valkey は、AOF がないとスナップショットを読まずに空で始まる（手元で確かめた）ので、戻すときは AOF を切った一時の Valkey で読み込み、`CONFIG SET appendonly yes` で AOF を作り直す（`scripts/restore-valkey.sh`）。CI の「README の手順の通し確認」で、取って戻せることを確かめる。
+- F8: `subscriber add` は、`-ki`・`-opc` を省くと標準入力の 1 行（`<Ki> <OPc>`）から鍵を読む（本物の鍵を引数に書かないため。§12）。
+- あわせて、CI の適合試験の固定のコミット（`MVPSET_REF`）を、契約 1.0.0 の aka-mvpset `2702966` に上げた。
 
 ## 17. 確認事項（2026-10-25 にすべて推奨案で合意。§3.2 の決定事項 1〜11）
 

@@ -4,6 +4,8 @@
 /secrets/
 # 監査ログの日ごとのファイル
 /audit/
+# Valkey のバックアップ（運用ガイド 9.2）
+/backups/
 /aka-vecgen
 
 # 検証用の環境の情報などを含むので公開しない

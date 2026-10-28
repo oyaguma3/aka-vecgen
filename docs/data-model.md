@@ -2,7 +2,7 @@
 
 - 状態: ドラフト
 - 対象: aka-vecgen が Valkey に持つデータと、その操作手順。
-- 関連: [設計概要（MVP）](design-overview.md)、[設計概要（PoC）](poc/design-overview.md)、[認証ベクターAPI の契約](https://github.com/oyaguma3/aka-mvpset/blob/main/docs/av-api-contract.md)、[管理API](openapi/admin-api.yaml)
+- 関連: [設計概要（MVP）](design-overview.md)、[もとの実装（aka-only-server）のデータモデル](https://github.com/oyaguma3/aka-only-server/blob/c2a093d0c336be039cd00f74631be5f1de4d4300/docs/data-model.md)、[認証ベクターAPI の契約](https://github.com/oyaguma3/aka-mvpset/blob/main/docs/av-api-contract.md)、[管理API](openapi/admin-api.yaml)
 
 ## 1. 前提
 
