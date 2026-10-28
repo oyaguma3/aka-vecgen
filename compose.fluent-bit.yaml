@@ -1,0 +1,31 @@
+# aka-radius と同じノードで動かすときに重ねる設定（データ面のノード。aka-radius の設計概要 §13）。
+# aka-vecgen とその Valkey のログを、Docker の fluentd のログドライバーで aka-radius の Fluent Bit（ホストの 127.0.0.1:24224）に送る。
+# Fluent Bit はアプリごとのファイル（aka-radius の deployments/logs_on_host/ の vecgen.log・vecgen-valkey.log）に書き、
+# ホストの logrotate で日ごとに圧縮してノードで 2 週間持つ。監視用の PC が取りに行く。
+#
+#   docker compose -f compose.yaml -f compose.fluent-bit.yaml up -d
+#
+# .env の COMPOSE_FILE=compose.yaml:compose.fluent-bit.yaml にすると、素の docker compose でも重なる。
+# fluentd-async にしているので、Fluent Bit がまだ動いていなくても起動できる（届くまでメモリーにためる）。
+# docker compose logs は、Docker のログの写し（dual logging）で引き続き見られる。
+x-fluent-bit-logging: &fluent-bit-logging
+  driver: fluentd
+  options: &fluent-bit-options
+    fluentd-address: localhost:24224
+    fluentd-async: "true"
+    fluentd-buffer-limit: "1048576"
+
+services:
+  aka-vecgen:
+    logging:
+      <<: *fluent-bit-logging
+      options:
+        <<: *fluent-bit-options
+        tag: app.vecgen
+
+  valkey:
+    logging:
+      <<: *fluent-bit-logging
+      options:
+        <<: *fluent-bit-options
+        tag: app.vecgen-valkey

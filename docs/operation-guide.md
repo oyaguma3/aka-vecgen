@@ -281,7 +281,15 @@ docker compose logs -f aka-vecgen
 | `STARTING` / `LISTENING` / `SHUTDOWN` | 起動・待ち受け・停止 |
 | `KEK_MISMATCH` など | 起動の失敗（2 章の表） |
 
-Docker のログは、既定では際限なく増える。ノードで 2 週間持てるように、`/etc/docker/daemon.json` でローテーションを設定する（例 `"log-driver": "json-file"`、`"log-opts": {"max-size": "50m", "max-file": "10"}`）。
+データ面のノード（aka-radius と同じノード）では、`compose.fluent-bit.yaml` を重ねて、aka-vecgen とその Valkey のログを aka-radius の Fluent Bit に送る（aka-radius の設計概要の決定事項 10）。Fluent Bit は aka-radius の `deployments/logs_on_host/` の `vecgen.log`・`vecgen-valkey.log` に書き、ホストの logrotate で日ごとに圧縮してノードで 2 週間持つ。監視用の PC が取りに行く。
+
+```bash
+docker compose -f compose.yaml -f compose.fluent-bit.yaml up -d
+```
+
+`.env` に `COMPOSE_FILE=compose.yaml:compose.fluent-bit.yaml` と書けば、素の `docker compose` でも重なる。Fluent Bit が動いていなくても起動できる（`fluentd-async`）。`docker compose logs` も引き続き使える。
+
+重ねないとき（aka-vecgen だけで動かすとき）は、Docker のログは既定では際限なく増える。ノードで 2 週間持てるように、`/etc/docker/daemon.json` でローテーションを設定する（例 `"log-driver": "json-file"`、`"log-opts": {"max-size": "50m", "max-file": "10"}`）。
 
 データ面の VPS では、aka-radius と同じ Fluent Bit に送り、アプリごとのファイルに書いて日ごとに圧縮する（aka-radius の設計概要の決定事項 10）。そのための重ね合わせのファイルと、Fluent Bit の出力先は、aka-radius の段階 2-5 で足す。
 
