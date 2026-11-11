@@ -68,7 +68,7 @@
 
 ## 4. 技術方針
 
-- もとの実装の方針を引き継ぐ。言語は Go 1.27.3。標準ライブラリを優先する（`net/http`、`crypto/tls`、`crypto/aes`・`crypto/cipher`、`encoding/json/v2`、`log/slog`）。
+- もとの実装の方針を引き継ぐ。言語は Go 1.27.4。標準ライブラリを優先する（`net/http`、`crypto/tls`、`crypto/aes`・`crypto/cipher`、`encoding/json/v2`、`log/slog`）。
 - 外部依存は `github.com/wmnsk/milenage` と `github.com/valkey-io/valkey-go` だけ（もとの実装と同じ）。
 - module パスは `github.com/oyaguma3/aka-vecgen`、コマンド名は `aka-vecgen`、環境変数の接頭辞は `VECGEN_`（§17 の B1）。
 - データベースは Valkey（単一ノード、AOF、`appendfsync always`）。
