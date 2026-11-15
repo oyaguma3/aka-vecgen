@@ -141,7 +141,14 @@ jobs:
       - name: Valkey のバックアップと戻し（運用ガイド 9 章）
         run: |
           mkdir -p backups
+          v() { docker compose exec -T valkey sh -c 'valkey-cli -a "$VALKEY_PASSWORD" --no-auth-warning "$@"' valkey-cli "$@"; }
+          # スナップショットを 1 鍵 0.1 秒遅らせて書き終わるまでの時間を延ばし、書き終わる前に写す誤り（前のスナップショットを写す）を
+          # 表に出す（aka-mvpset の段階 6 の B6-1）。試験のためだけの設定で、戻すときの起動で消える。写しの直前に書いた印が戻ることを確かめる
+          v CONFIG SET rdb-key-save-delay 100000
+          for i in $(seq 1 20); do v SET "ci:pad:$i" x > /dev/null; done
+          v SET ci:marker before
           scripts/backup-valkey.sh backups/valkey.rdb
+          v CONFIG SET rdb-key-save-delay 0
           # 写しの後に、標準入力の鍵で加入者を足す（運用ガイド 5.4）。戻すと消える
           echo "465b5ce8b199b49faa5f0a2ee238a6bc cd63cb71954a9f4e48a5994e37a02baf" |
             docker compose exec -T aka-vecgen /aka-vecgen subscriber add -imsi 440100123456780 -clients 1
@@ -152,6 +159,7 @@ jobs:
             echo "写しの後に足した加入者が残っています"
             exit 1
           fi
+          test "$(v GET ci:marker)" = before
           # 写しの前の加入者は戻り、払い出せる
           curl -sS --fail-with-body --retry 10 --retry-delay 2 --retry-all-errors --cacert server-new.pem --cert radius.pem -X POST \
             https://localhost:8443/nudm-ueau/v1/imsi-440100123456789/hss-security-information/eap-aka/generate-av \
