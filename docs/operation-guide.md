@@ -127,6 +127,8 @@ aka-radius から届いた要求のログの `trace_id` は、aka-radius が `X-
    ```
 
 3. 読み直せたことを確かめる。ログに `ADMIN_CLIENTS_RELOADED` が出て、`GET /admin/v2/status` の `adminClients` と `adminClientsLoadedAt` が変わる。ファイルの形が違えば `ADMIN_CLIENTS_RELOAD_ERR` を出し、前の設定のまま続ける。
+
+   `docker compose kill -s HUP` を送ったコンテナには Docker が「手で止めた」の印を付けるので、ホストを再起動すると `unless-stopped` でも起き上がらない（aka-mvpset の段階 5 の T5-15）。送った後に `docker compose up -d aka-vecgen` を一度流して印を消す（動いているコンテナは作り直されない）。aka-mvpset の配置では、起動のときに `aka-compose-up.service` が起こし直す。この後の章の `SIGHUP` も同じ。
 4. 管理API 用のサーバー証明書を取り出し、aka-provisioner の下流の登録簿に設定する。
 
    ```bash
